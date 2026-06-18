@@ -437,8 +437,51 @@ class ProjectDataOrganizer:
         print(f"Data successfully exported to {filename}")
 
         tex_filename = filename.replace(".csv", ".tex")
-        df.to_latex(tex_filename, index=False, escape=False)
+        self._write_latex_table(data_list, tex_filename)
         print(f"Data successfully exported to {tex_filename}")
+
+    @staticmethod
+    def _write_latex_table(rows, tex_filename):
+        """Write a publication-ready booktabs LaTeX table with a two-line header.
+
+        - Underscores in target names become '~' (non-breaking space), so
+          'ACT-CL_J0001.9+0112' renders as 'ACT-CL J0001.9+0112'.
+        - Header is split over two rows: column name, then unit.
+        Requires \\usepackage{booktabs} in the document preamble.
+        """
+        # (name, unit) per column, in the same order as the data rows
+        header = [
+            ("Target",                 ""),
+            ("Project",                "code"),
+            ("Dish size",              "[m]"),
+            ("Time on source",         "[min]"),
+            ("Frequency",              "[GHz]"),
+            ("White-noise sens.",      r"[$\mu$Jy]"),
+            ("Recoverable scale",      "min / max [arcsec]"),
+        ]
+        names = " & ".join(n for n, _ in header) + r" \\"
+        units = " & ".join(u for _, u in header) + r" \\"
+        colspec = "l" + "c" * (len(header) - 1)
+
+        lines = [
+            "% Requires \\usepackage{booktabs}",
+            r"\begin{table}",
+            r"\centering",
+            r"\caption{ALMA observation summary.}",
+            r"\label{tab:project_data}",
+            r"\begin{tabular}{" + colspec + "}",
+            r"\toprule",
+            names,
+            units,
+            r"\midrule",
+        ]
+        for row in rows:
+            cells = [str(row[0]).replace("_", "~")] + [str(c) for c in row[1:]]
+            lines.append(" & ".join(cells) + r" \\")
+        lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
+
+        with open(tex_filename, mode="w") as f:
+            f.write("\n".join(lines))
 
     def export(self, output_root: str = "../../output/vis") -> None:
         """Instantiate and run Export for every group; attaches instance to data["export"]."""
