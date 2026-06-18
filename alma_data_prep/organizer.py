@@ -514,10 +514,11 @@ class ProjectDataOrganizer:
         combine_arrays: bool = False,
         bad_channel_sigma: float = 1.5,
         detection_sigma: float = 5.5,
+        do_linesub: bool = True,
     ) -> None:
 
         """Run the spectral cube pipeline for every group (or jointly per target if combine_arrays=True)."""
-        
+
         if not self.concatted:
             print("Warning: Data not concatenated yet; run mstransform_and_concat() first.")
 
@@ -528,7 +529,7 @@ class ProjectDataOrganizer:
             if line_freq_hz is None:
                 line_freq_hz = rest_freq_hz
 
-        run_kw = dict(line_freq_hz=line_freq_hz)
+        run_kw = dict(line_freq_hz=line_freq_hz, do_linesub=do_linesub)
 
         if combine_arrays:
             target_data = defaultdict(lambda: {"vis_list": [], "dish_sizes": [], "groups": []})

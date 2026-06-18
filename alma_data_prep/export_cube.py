@@ -434,7 +434,7 @@ class ExportCube:
                 outfile=os.path.join(diag_dir, "moment8_detections.png"),
                 continuum_map=continuum_map, continuum_std=continuum_std,
             )
-            return
+            return []
 
         # Per-detection spectrum extraction and plotting
         HALF_BW_GHZ  = 0.75   # show ±0.75 GHz (= 1.5 GHz total) around the line
@@ -496,6 +496,12 @@ class ExportCube:
                 "amplitude_mJy":  f"{amp_jy * 1e3:.3f}",
                 "peak_flux_mJy":  f"{peak_flux_jy * 1e3:.3f}",
                 "integral_mJy_kms": f"{integral:.1f}",
+                # geometry for line-subtraction mask (not written to CSV)
+                "a_arcsec":       a_pix * cdelt2_deg * 3600.0,
+                "b_arcsec":       b_pix * cdelt2_deg * 3600.0,
+                "pa_deg":         bpa_deg,
+                "center_GHz_f":   center_ghz,
+                "fwhm_kms_f":     fwhm_kms,
             })
 
             if z_est is not None:
@@ -601,13 +607,20 @@ class ExportCube:
         )
 
         # Write Gaussian statistics of kept detections to CSV
+        # (geometry keys ending in arcsec/deg/_f are for line subtraction, not CSV)
+        csv_cols = ["detection", "RA_J2000", "Dec_J2000", "RA_deg", "Dec_deg",
+                    "pix_x", "pix_y", "n_pix", "center_GHz", "peak_GHz",
+                    "redshift", "FWHM_kms", "amplitude_mJy", "peak_flux_mJy",
+                    "integral_mJy_kms"]
         if detections:
             csv_path = os.path.join(output_dir, "detections.csv")
             with open(csv_path, mode="w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=list(detections[0].keys()))
+                writer = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(detections)
             print(f"[ExportCube] Wrote {len(detections)} detection(s) to {csv_path}")
+
+        return detections
 
     # ---- Pipeline --------------------------------------------------------
 
@@ -723,8 +736,10 @@ class ExportCube:
         return data, float(np.nanstd(data))
 
     def run_all(self, do_uvcontsub: bool, bad_channel_sigma: float, detection_sigma: float,
-                imagename: Optional[str] = None, line_freq_hz: Optional[float] = None) -> None:
-        """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra."""
+                imagename: Optional[str] = None, line_freq_hz: Optional[float] = None,
+                do_linesub: bool = True, linesub_nsigma: float = 1.0,
+                linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0) -> None:
+        """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra → linesub."""
         out      = self.output_dir / "analysis"
         diag_dir = out / "diagnostics"
         out.mkdir(parents=True, exist_ok=True)
@@ -765,13 +780,38 @@ class ExportCube:
             m8_name = os.path.splitext(fits_stem)[0] + "_moment8.fits"
         ExportCube.save_moment8_fits(m8, header, str(self.output_dir / "fits" / m8_name))
 
-        ExportCube.extract_and_plot_profiles(data, m8, header, hdul,
-                                             output_dir=str(out / "spectra"),
-                                             sigma=detection_sigma,
-                                             line_freq_hz=line_freq_hz,
-                                             bad_channels=bad,
-                                             continuum_map=cont_map,
-                                             continuum_std=cont_std)
+        detections = ExportCube.extract_and_plot_profiles(
+            data, m8, header, hdul,
+            output_dir=str(out / "spectra"),
+            sigma=detection_sigma,
+            line_freq_hz=line_freq_hz,
+            bad_channels=bad,
+            continuum_map=cont_map,
+            continuum_std=cont_std,
+        )
+
+        # Clean the line model inside detection masks and subtract it from the
+        # non-continuum-subtracted visibilities (-> *_linesubtracted.ms).
+        if do_linesub and detections:
+            try:
+                from .linesub import LineSubtractor       # package layout
+            except ImportError:
+                from linesub import LineSubtractor         # flat layout (data_prep)
+            line_vis = contsub_paths if contsub_paths else self.concatvis
+            if not contsub_paths:
+                print("[ExportCube] Warning: no contsub MS; cleaning line model from "
+                      "raw data (model will include continuum).")
+            LineSubtractor(
+                output_dir=str(self.output_dir),
+                imsize=self.config.imsize or 512,
+                cell=self.config.cell or "1.5arcsec",
+                weighting=self.config.weighting, gridder=self.config.gridder,
+                pblimit=self.config.pblimit,
+                restfreq=self.config.restfreq or "", width_kms=self.config.width_kms,
+                nsigma=linesub_nsigma, niter=linesub_niter, n_fwhm=linesub_n_fwhm,
+                overwrite=self.overwrite,
+            ).run(line_vis=line_vis, target_vis=self.concatvis,
+                  detections=detections, imagename=imagename)
 
         for log in Path(".").glob("casa*.log"):
             log.unlink()
