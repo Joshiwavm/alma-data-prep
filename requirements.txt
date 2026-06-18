@@ -1,0 +1,7 @@
+# Runtime dependencies (PyPI). Install with: pip install -r requirements.txt
+# casatasks / casatools come from the CASA runtime and are NOT listed here.
+# analysisUtils (CASA analysis_scripts) is an external script -- see README.
+numpy
+astropy
+matplotlib
+pandas

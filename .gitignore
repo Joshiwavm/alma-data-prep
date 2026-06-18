@@ -1,0 +1,40 @@
+# CASA logs / scratch
+casa*.log
+*.last
+TempLattice*/
+*.lattice/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# Data products (never commit visibilities / images)
+*.ms/
+*.ms.split.cal/
+*.ms.contsub/
+*.ms.listobs
+*.fits
+*.npy
+*.npz
+*.image/
+*.pb/
+*.psf/
+*.model/
+*.residual/
+*.weight/
+*.sumwt/
+*.mask/
+
+# Outputs
+output/
+plots/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

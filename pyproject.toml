@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alma-data-prep"
+version = "0.1.0"
+description = "ALMA visibility organization, concatenation, and spectral-cube export utilities."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Joshiwa van Marrewijk" }]
+keywords = ["ALMA", "radio astronomy", "CASA", "interferometry"]
+
+# NOTE: casatasks / casatools are provided by the CASA runtime and are NOT
+# listed here. analysisUtils (CASA analysis_scripts) is an external script,
+# not a PyPI package -- see README for setup.
+dependencies = [
+    "numpy",
+    "astropy",
+    "matplotlib",
+    "pandas",
+]
+
+[project.urls]
+Homepage = "https://github.com/Joshiwavm/alma-data-prep"
+Repository = "https://github.com/Joshiwavm/alma-data-prep"
+
+[tool.setuptools]
+packages = ["alma_data_prep"]
