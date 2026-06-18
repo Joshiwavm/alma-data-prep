@@ -26,7 +26,7 @@ import os
 import shutil
 import subprocess
 
-from casatasks import tclean, exportfits, ft, uvsub, clearcal
+from casatasks import tclean, exportfits, ft, uvsub, clearcal, split
 
 C_KMS = 2.99792458e5
 
@@ -89,6 +89,8 @@ class LineSubtractor:
         self.niter      = niter
         self.n_fwhm     = n_fwhm
         self.overwrite  = overwrite
+        self.model_image_fits = None   # restored clean image (Jy/beam)
+        self.model_cube_fits  = None   # clean components cube (Jy/pixel)
 
     def _clean_line_model(self, line_vis: List[str],
                           detections: Sequence[Dict[str, Any]],
@@ -122,6 +124,9 @@ class LineSubtractor:
         )
         exportfits(f"{imagename_full}.image", f"{imagename_full}.image.fits", overwrite=True)
         exportfits(f"{imagename_full}.model", f"{imagename_full}.model.fits", overwrite=True)
+        # Remember FITS products (clean components cube used by the validation plot)
+        self.model_image_fits = f"{imagename_full}.image.fits"
+        self.model_cube_fits  = f"{imagename_full}.model.fits"
         return f"{imagename_full}.model"
 
     def run(self, line_vis, target_vis, detections, imagename: Optional[str] = None) -> List[str]:
@@ -164,10 +169,17 @@ class LineSubtractor:
                     outputs.append(out)
                     continue
             print(f"[LineSubtractor]   {ms} -> {out}")
-            shutil.copytree(ms, out)
-            clearcal(vis=out, addmodel=True)   # create CORRECTED (=DATA) and MODEL columns
-            ft(vis=out, model=model, usescratch=True)
-            uvsub(vis=out)                     # CORRECTED = CORRECTED - MODEL
+            tmp = ms.replace(".ms", "_linesub_tmp.ms")
+            if os.path.exists(tmp):
+                _safe_rmtree(tmp)
+            shutil.copytree(ms, tmp)
+            clearcal(vis=tmp, addmodel=True)   # create CORRECTED (=DATA) and MODEL columns
+            ft(vis=tmp, model=model, usescratch=True)
+            uvsub(vis=tmp)                     # CORRECTED = CORRECTED - MODEL (line removed)
+            # Materialize line-removed CORRECTED into DATA so downstream Export/
+            # ExportCube (which read the DATA column) use the subtracted visibilities.
+            split(vis=tmp, outputvis=out, datacolumn="corrected")
+            _safe_rmtree(tmp)
             outputs.append(out)
 
         # Cleanup the clean-model CASA images (FITS copies are kept)

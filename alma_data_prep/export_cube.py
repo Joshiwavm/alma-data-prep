@@ -130,6 +130,21 @@ class ExportCube:
                 / (abs(header.get("CDELT1", 1)) * abs(header.get("CDELT2", 1))))
 
     @staticmethod
+    def _ellipse_spectrum(cube, header, hdul, px, py, a_pix, b_pix, pa_deg, jy_per_pixel):
+        """Return spectrum [Jy] summed over a 4σ ellipse at (px, py).
+
+        If the cube is in Jy/beam (jy_per_pixel=False) divide by the beam area
+        in pixels; if it is already Jy/pixel (e.g. a clean-component .model
+        cube) sum directly.
+        """
+        nchan, ny, nx = cube.shape
+        ell  = ExportCube._ellipse_mask((ny, nx), py, px, a_pix, b_pix, pa_deg).ravel()
+        spec = np.nansum(cube.reshape(nchan, ny * nx)[:, ell], axis=1).astype(float)
+        if not jy_per_pixel:
+            spec = spec / ExportCube._beam_area_pixels(header, hdul)
+        return spec
+
+    @staticmethod
     def _ellipse_mask(shape, cy, cx, a_pix, b_pix, pa_deg=0.0):
         """Return 2D boolean mask for an ellipse centred at (cy, cx)."""
         ny, nx         = shape
@@ -738,7 +753,8 @@ class ExportCube:
     def run_all(self, do_uvcontsub: bool, bad_channel_sigma: float, detection_sigma: float,
                 imagename: Optional[str] = None, line_freq_hz: Optional[float] = None,
                 do_linesub: bool = True, linesub_nsigma: float = 1.0,
-                linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0) -> None:
+                linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0,
+                validate_linesub: bool = True) -> None:
         """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra → linesub."""
         out      = self.output_dir / "analysis"
         diag_dir = out / "diagnostics"
@@ -801,7 +817,7 @@ class ExportCube:
             if not contsub_paths:
                 print("[ExportCube] Warning: no contsub MS; cleaning line model from "
                       "raw data (model will include continuum).")
-            LineSubtractor(
+            ls = LineSubtractor(
                 output_dir=str(self.output_dir),
                 imsize=self.config.imsize or 512,
                 cell=self.config.cell or "1.5arcsec",
@@ -810,11 +826,88 @@ class ExportCube:
                 restfreq=self.config.restfreq or "", width_kms=self.config.width_kms,
                 nsigma=linesub_nsigma, niter=linesub_niter, n_fwhm=linesub_n_fwhm,
                 overwrite=self.overwrite,
-            ).run(line_vis=line_vis, target_vis=self.concatvis,
-                  detections=detections, imagename=imagename)
+            )
+            linesub_ms = ls.run(line_vis=line_vis, target_vis=self.concatvis,
+                                detections=detections, imagename=imagename)
+
+            if validate_linesub and linesub_ms:
+                self._validate_linesub(data, header, hdul, detections,
+                                       ls.model_cube_fits, linesub_ms,
+                                       imagename, str(diag_dir))
 
         for log in Path(".").glob("casa*.log"):
             log.unlink()
             print(f"[ExportCube] Removed {log}")
 
         print(f"[ExportCube] run_all() done — {out}")
+
+    def _validate_linesub(self, dirty_cube, header, hdul, detections,
+                          model_cube_fits, linesub_ms_list, imagename, diag_dir):
+        """Per-detection diagnostic: overplot dirty / clean-model / line-removed spectra.
+
+        - dirty: spectrum from the continuum-subtracted cube (has the line)
+        - clean model: spectrum from the clean-component cube (Jy/pixel)
+        - line-removed: line-subtracted data, continuum-subtracted again and
+          re-imaged; should be ~flat noise in the line window.
+        """
+        if not linesub_ms_list or not model_cube_fits or not os.path.exists(model_cube_fits):
+            print("[ExportCube] Line-sub validation skipped (missing inputs).")
+            return
+
+        # Continuum-subtract and re-image the line-removed data
+        val_contsub = []
+        for ms in linesub_ms_list:
+            cs = ms + ".contsub"
+            if os.path.exists(cs):
+                if self.overwrite:
+                    _safe_rmtree(cs)
+                else:
+                    val_contsub.append(cs)
+                    continue
+            casa_uvcontsub(vis=ms, outputvis=cs, fitspec="", fitorder=0)
+            val_contsub.append(cs)
+
+        val_fits = self.make_cube(imagename=(imagename or "cube") + "_linesubval",
+                                  vis_list=val_contsub)
+        val_cube, val_hdr, val_hdul = ExportCube.load_fits_cube(val_fits)
+        mdl_cube, mdl_hdr, mdl_hdul = ExportCube.load_fits_cube(model_cube_fits)
+
+        freq_ghz   = ExportCube._get_freq_axis(header, dirty_cube.shape[0]) / 1e9
+        cdelt2_deg = abs(header.get("CDELT2", 1))
+
+        for d in detections:
+            px = int(d["pix_x"]); py = int(d["pix_y"])
+            a_pix = float(d["a_arcsec"]) / (cdelt2_deg * 3600.0)
+            b_pix = float(d["b_arcsec"]) / (cdelt2_deg * 3600.0)
+            pa    = float(d["pa_deg"])
+            cen   = float(d["center_GHz_f"]); fwhm = float(d["fwhm_kms_f"])
+
+            dirty = ExportCube._ellipse_spectrum(dirty_cube, header,  hdul,     px, py, a_pix, b_pix, pa, False) * 1e3
+            model = ExportCube._ellipse_spectrum(mdl_cube,   mdl_hdr, mdl_hdul, px, py, a_pix, b_pix, pa, True)  * 1e3
+            resid = ExportCube._ellipse_spectrum(val_cube,   val_hdr, val_hdul, px, py, a_pix, b_pix, pa, False) * 1e3
+
+            fwhm_ghz = fwhm / C_KMS * cen
+            zlo = max(freq_ghz.min(), cen - 5.0 * fwhm_ghz)
+            zhi = min(freq_ghz.max(), cen + 5.0 * fwhm_ghz)
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.plot(freq_ghz, dirty, color="steelblue", lw=1.0, drawstyle="steps-mid",
+                    label="dirty (cont-sub)")
+            ax.plot(freq_ghz, model, color="darkorange", lw=1.6, drawstyle="steps-mid",
+                    label="clean model")
+            ax.plot(freq_ghz, resid, color="green", lw=1.0, drawstyle="steps-mid",
+                    label="line-removed (re-cont-sub)")
+            ax.axhline(0, color="gray", lw=0.6, ls="--")
+            ax.axvline(cen, color="darkorange", ls=":", lw=0.8)
+            ax.set_xlim(zlo, zhi)
+            ax.set_xlabel("Frequency [GHz]", fontsize=11)
+            ax.set_ylabel("Flux density [mJy]", fontsize=11)
+            ax.set_title(f"Line-sub validation — det {d['detection']} "
+                         f"({px},{py})", fontsize=10)
+            ax.legend(fontsize=8, loc="upper right")
+            plt.tight_layout()
+            outp = os.path.join(diag_dir, f"linesub_validation_det{int(d['detection']):02d}.png")
+            plt.savefig(outp, dpi=150)
+            plt.close()
+
+        print(f"[ExportCube] Line-sub validation plots -> {diag_dir}")
