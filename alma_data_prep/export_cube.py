@@ -656,19 +656,21 @@ class ExportCube:
             output_paths.append(outputvis)
         return output_paths
 
-    def make_cube(self, imagename: Optional[str] = None, vis_list: Optional[List[str]] = None) -> str:
+    def make_cube(self, imagename: Optional[str] = None, vis_list: Optional[List[str]] = None,
+                  overwrite: Optional[bool] = None) -> str:
         """Run tclean (specmode=cube) and export FITS; returns path to the FITS cube."""
+        ow             = self.overwrite if overwrite is None else overwrite
         fits_dir       = self.output_dir / "fits"
         fits_dir.mkdir(parents=True, exist_ok=True)
         imagename      = imagename or f"{(self.target or 'cube').replace(' ', '_')}_cube"
         imagename_full = str(fits_dir / imagename)
         fits_path      = f"{imagename_full}.cube.fits"
 
-        if not self.overwrite and os.path.exists(fits_path):
+        if not ow and os.path.exists(fits_path):
             print(f"[ExportCube] Skipping tclean — cube exists (overwrite=False): {fits_path}")
             return fits_path
 
-        if self.overwrite:
+        if ow:
             for suffix in [".image", ".pb", ".psf", ".model", ".sumwt", ".weight", ".residual", ".mask"]:
                 p = f"{imagename_full}{suffix}"
                 if os.path.exists(p):
@@ -754,7 +756,8 @@ class ExportCube:
                 imagename: Optional[str] = None, line_freq_hz: Optional[float] = None,
                 do_linesub: bool = True, linesub_nsigma: float = 1.0,
                 linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0,
-                validate_linesub: bool = True) -> None:
+                validate_linesub: bool = True,
+                linesub_overwrite: Optional[bool] = None) -> None:
         """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra → linesub."""
         out      = self.output_dir / "analysis"
         diag_dir = out / "diagnostics"
@@ -817,6 +820,7 @@ class ExportCube:
             if not contsub_paths:
                 print("[ExportCube] Warning: no contsub MS; cleaning line model from "
                       "raw data (model will include continuum).")
+            ls_ow = self.overwrite if linesub_overwrite is None else linesub_overwrite
             ls = LineSubtractor(
                 output_dir=str(self.output_dir),
                 imsize=self.config.imsize or 512,
@@ -825,7 +829,7 @@ class ExportCube:
                 pblimit=self.config.pblimit,
                 restfreq=self.config.restfreq or "", width_kms=self.config.width_kms,
                 nsigma=linesub_nsigma, niter=linesub_niter, n_fwhm=linesub_n_fwhm,
-                overwrite=self.overwrite,
+                overwrite=ls_ow,
             )
             linesub_ms = ls.run(line_vis=line_vis, target_vis=self.concatvis,
                                 detections=detections, imagename=imagename)
@@ -833,7 +837,7 @@ class ExportCube:
             if validate_linesub and linesub_ms:
                 self._validate_linesub(data, header, hdul, detections,
                                        ls.model_cube_fits, linesub_ms,
-                                       imagename, str(diag_dir))
+                                       imagename, str(diag_dir), overwrite=ls_ow)
 
         for log in Path(".").glob("casa*.log"):
             log.unlink()
@@ -842,7 +846,8 @@ class ExportCube:
         print(f"[ExportCube] run_all() done — {out}")
 
     def _validate_linesub(self, dirty_cube, header, hdul, detections,
-                          model_cube_fits, linesub_ms_list, imagename, diag_dir):
+                          model_cube_fits, linesub_ms_list, imagename, diag_dir,
+                          overwrite=False):
         """Per-detection diagnostic: overplot dirty / clean-model / line-removed spectra.
 
         - dirty: spectrum from the continuum-subtracted cube (has the line)
@@ -859,7 +864,7 @@ class ExportCube:
         for ms in linesub_ms_list:
             cs = ms + ".contsub"
             if os.path.exists(cs):
-                if self.overwrite:
+                if overwrite:
                     _safe_rmtree(cs)
                 else:
                     val_contsub.append(cs)
@@ -868,7 +873,7 @@ class ExportCube:
             val_contsub.append(cs)
 
         val_fits = self.make_cube(imagename=(imagename or "cube") + "_linesubval",
-                                  vis_list=val_contsub)
+                                  vis_list=val_contsub, overwrite=overwrite)
         val_cube, val_hdr, val_hdul = ExportCube.load_fits_cube(val_fits)
         mdl_cube, mdl_hdr, mdl_hdul = ExportCube.load_fits_cube(model_cube_fits)
 

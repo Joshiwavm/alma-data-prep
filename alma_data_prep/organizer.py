@@ -495,6 +495,37 @@ class ProjectDataOrganizer:
                     print(data["export"])
                     data["export"].run_all()
 
+    def export_linesubtracted(self, output_root: str = "../../output/vis_linesub") -> None:
+        """Run Export on the *_linesubtracted.ms produced by export_cube().
+
+        Discovers, for each group, the line-removed MS derived from its
+        concatvis (``<concatvis>`` -> ``*_linesubtracted.ms``) and runs the
+        continuum Export pipeline on it. Skips groups whose line-removed MS
+        does not exist yet.
+        """
+        for data in self._iter_groups():
+            cv = data.get("concatvis")
+            if not cv:
+                continue
+            linesub = cv.replace(".ms", "_linesubtracted.ms")
+            if not os.path.exists(linesub):
+                print(f"Warning: {linesub} not found; run export_cube() first. Skipping.")
+                continue
+
+            dish_sizes  = data.get("dish_sizes")
+            target      = data.get("target")
+            target_safe = target.replace(" ", "_") if target else "unknown"
+            exp = Export(
+                target=target,
+                dish_size_m=int(min(dish_sizes)) if dish_sizes else None,
+                median_freq_ghz=data.get("median_frequency"),
+                concatvis=linesub,
+                output_dir=str(Path(output_root) / target_safe),
+            )
+            data["export_linesub"] = exp
+            print(exp)
+            exp.run_all()
+
     def _iter_groups(self):
         """Yield every group data dict across all projects/science_goals/groups."""
         for sgs in self.projects.values():
@@ -515,6 +546,8 @@ class ProjectDataOrganizer:
         bad_channel_sigma: float = 1.5,
         detection_sigma: float = 5.5,
         do_linesub: bool = True,
+        validate_linesub: bool = True,
+        linesub_overwrite: bool = None,
     ) -> None:
 
         """Run the spectral cube pipeline for every group (or jointly per target if combine_arrays=True)."""
@@ -529,7 +562,9 @@ class ProjectDataOrganizer:
             if line_freq_hz is None:
                 line_freq_hz = rest_freq_hz
 
-        run_kw = dict(line_freq_hz=line_freq_hz, do_linesub=do_linesub)
+        run_kw = dict(line_freq_hz=line_freq_hz, do_linesub=do_linesub,
+                      validate_linesub=validate_linesub,
+                      linesub_overwrite=linesub_overwrite)
 
         if combine_arrays:
             target_data = defaultdict(lambda: {"vis_list": [], "dish_sizes": [], "groups": []})
