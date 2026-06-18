@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, List
 
 import os
+import csv
 import shutil
 import subprocess
 import numpy as np
@@ -440,6 +441,8 @@ class ExportCube:
         cube_2d      = cube_jy_pix.reshape(nchan, ny * nx)
         kept_regions    = []
         skipped_regions = []
+        detections      = []   # per-kept-detection stats for CSV
+        wcs2d           = WCS(header).celestial
 
         for idx, (py, px, ell) in enumerate(regions, start=1):
             ell_flat    = ell.ravel()
@@ -470,6 +473,31 @@ class ExportCube:
                 skipped_regions.append((py, px, ell))
                 continue
             kept_regions.append((py, px, ell))
+
+            # Sky coordinates (J2000) of the detection peak pixel
+            sky      = wcs2d.pixel_to_world(px, py)
+            ra_deg   = float(sky.icrs.ra.deg)
+            dec_deg  = float(sky.icrs.dec.deg)
+            radec_hd = sky.icrs.to_string("hmsdms", sep=":", precision=2)
+            ra_str, dec_str = radec_hd.split(" ")
+            detections.append({
+                "detection":      len(kept_regions),
+                "RA_J2000":       ra_str,
+                "Dec_J2000":      dec_str,
+                "RA_deg":         f"{ra_deg:.6f}",
+                "Dec_deg":        f"{dec_deg:.6f}",
+                "pix_x":          px,
+                "pix_y":          py,
+                "n_pix":          n_pix,
+                "center_GHz":     f"{center_ghz:.6f}",
+                "peak_GHz":       f"{peak_freq_ghz:.6f}",
+                "redshift":       f"{z_est:.6f}" if z_est is not None else "",
+                "FWHM_kms":       f"{fwhm_kms:.1f}",
+                "amplitude_mJy":  f"{amp_jy * 1e3:.3f}",
+                "peak_flux_mJy":  f"{peak_flux_jy * 1e3:.3f}",
+                "integral_mJy_kms": f"{integral:.1f}",
+            })
+
             if z_est is not None:
                 print(f"[ExportCube]   Redshift: z = {z_est:.6f}  (v = {z_est * C_KMS:.0f} km/s)")
 
@@ -571,6 +599,15 @@ class ExportCube:
             skipped_regions=skipped_regions,
             continuum_map=continuum_map, continuum_std=continuum_std,
         )
+
+        # Write Gaussian statistics of kept detections to CSV
+        if detections:
+            csv_path = os.path.join(output_dir, "detections.csv")
+            with open(csv_path, mode="w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(detections[0].keys()))
+                writer.writeheader()
+                writer.writerows(detections)
+            print(f"[ExportCube] Wrote {len(detections)} detection(s) to {csv_path}")
 
     # ---- Pipeline --------------------------------------------------------
 
