@@ -171,11 +171,14 @@ class ExportCube:
     @staticmethod
     def _save_detection_overview_plot(moment8_map, header, regions,
                                       a_pix, b_pix, bpa_deg, sigma, threshold, outfile,
-                                      skipped_regions=None):
+                                      skipped_regions=None,
+                                      continuum_map=None, continuum_std=None):
         """Save moment-8 image with 4σ beam ellipses.
 
         Kept detections drawn with colored solid ellipses; skipped detections
-        (failed FWHM cut) drawn with grey dashed ellipses.
+        (failed FWHM cut) drawn with grey dashed ellipses. If a continuum map
+        and its std are supplied, overlay contours at [-5,-3,3,5,7]×std
+        (negative dashed, positive solid).
         """
         skipped_regions = skipped_regions or []
         wcs2d = WCS(header).celestial
@@ -190,6 +193,23 @@ class ExportCube:
         plt.colorbar(im, ax=ax, label='Peak SNR', shrink=0.85)
         ax.contour(moment8_map, levels=[threshold],
                    colors=['white'], linewidths=0.8, linestyles='--', alpha=0.7)
+
+        # Continuum contours at [-5,-3,3,5,7]×std (negative dashed, positive solid)
+        if (continuum_map is not None and continuum_std
+                and np.isfinite(continuum_std) and continuum_std > 0):
+            if continuum_map.shape == moment8_map.shape:
+                neg = [m * continuum_std for m in (-5, -3)]
+                pos = [m * continuum_std for m in (3, 5, 7)]
+                ax.contour(continuum_map, levels=neg, colors='cyan',
+                           linewidths=0.7, linestyles='dashed', alpha=0.9)
+                ax.contour(continuum_map, levels=pos, colors='cyan',
+                           linewidths=0.7, linestyles='solid', alpha=0.9)
+                ax.plot([], [], color='cyan', lw=0.7,
+                        label=r'continuum $\pm$[3,5,7]$\sigma$')
+                ax.legend(fontsize=8, loc='lower right')
+            else:
+                print(f"[ExportCube] Continuum shape {continuum_map.shape} != "
+                      f"moment-8 shape {moment8_map.shape}; skipping contours.")
 
         colors = plt.cm.tab10(np.linspace(0, 1, 10))
         for i, (cy, cx, _ell) in enumerate(regions):
@@ -347,7 +367,8 @@ class ExportCube:
 
     @staticmethod
     def extract_and_plot_profiles(cube, moment8_map, header, hdul, output_dir,
-                                  sigma, line_freq_hz=None, bad_channels=None):
+                                  sigma, line_freq_hz=None, bad_channels=None,
+                                  continuum_map=None, continuum_std=None):
         """Greedy 4σ-ellipse extraction of spectral line profiles from the moment-8 map.
 
         Algorithm
@@ -365,6 +386,10 @@ class ExportCube:
             REST frequency [Hz] used to compute z = ν_rest / ν_obs − 1.
         bad_channels : list of int, optional
             Channel indices masked before fitting.
+        continuum_map : 2D array, optional
+            Continuum image (same pixel grid as moment-8) for contour overlay.
+        continuum_std : float, optional
+            Std of the continuum map; contours drawn at [-5,-3,3,5,7]×std.
         """
         os.makedirs(output_dir, exist_ok=True)
         bad_set       = set(bad_channels or [])
@@ -406,6 +431,7 @@ class ExportCube:
             ExportCube._save_detection_overview_plot(
                 moment8_map, header, [], a_pix, b_pix, bpa_deg, sigma, threshold,
                 outfile=os.path.join(diag_dir, "moment8_detections.png"),
+                continuum_map=continuum_map, continuum_std=continuum_std,
             )
             return
 
@@ -543,6 +569,7 @@ class ExportCube:
             a_pix, b_pix, bpa_deg, sigma, threshold,
             outfile=os.path.join(diag_dir, "moment8_detections.png"),
             skipped_regions=skipped_regions,
+            continuum_map=continuum_map, continuum_std=continuum_std,
         )
 
     # ---- Pipeline --------------------------------------------------------
@@ -603,6 +630,61 @@ class ExportCube:
 
         return fits_path
 
+    def make_continuum(self, imagename: Optional[str] = None,
+                       vis_list: Optional[List[str]] = None) -> str:
+        """Dirty MFS continuum image over all fields/SPWs (pre-contsub).
+
+        Uses the same imsize/cell as the cube so the pixel grid matches the
+        moment-8 map for contour overlay. niter=0 (dirty). Returns FITS path.
+        """
+        fits_dir       = self.output_dir / "fits"
+        fits_dir.mkdir(parents=True, exist_ok=True)
+        imagename      = (imagename or f"{(self.target or 'cube').replace(' ', '_')}") + "_continuum"
+        imagename_full = str(fits_dir / imagename)
+        fits_path      = f"{imagename_full}.cont.fits"
+
+        if not self.overwrite and os.path.exists(fits_path):
+            print(f"[ExportCube] Skipping continuum tclean — exists (overwrite=False): {fits_path}")
+            return fits_path
+
+        if self.overwrite:
+            for suffix in [".image", ".pb", ".psf", ".model", ".sumwt", ".weight", ".residual", ".mask"]:
+                p = f"{imagename_full}{suffix}"
+                if os.path.exists(p):
+                    _safe_rmtree(p)
+
+        vis_to_use = vis_list or self.concatvis
+        tclean(
+            vis=vis_to_use if len(vis_to_use) > 1 else vis_to_use[0],
+            imagename=imagename_full,
+            imsize=self.config.imsize or 512,
+            cell=self.config.cell or "1.5arcsec",
+            weighting=self.config.weighting, gridder=self.config.gridder,
+            niter=0, pblimit=self.config.pblimit,
+            specmode="mfs",
+            spw="", field="",
+            parallel=False,
+        )
+        exportfits(f"{imagename_full}.image", fits_path, overwrite=True)
+        for suffix in [".image", ".pb", ".psf", ".model", ".sumwt", ".weight", ".residual", ".mask"]:
+            p = f"{imagename_full}{suffix}"
+            if os.path.exists(p):
+                _safe_rmtree(p)
+
+        return fits_path
+
+    @staticmethod
+    def load_continuum_map(fits_path):
+        """Load a 2-D continuum image and its std. Returns (map_2d, std)."""
+        hdul = fits.open(fits_path)
+        data = hdul[0].data.squeeze()
+        hdul.close()
+        if data.ndim == 3:
+            data = data[0]
+        if data.ndim != 2:
+            raise ValueError(f"[ExportCube] Unexpected continuum shape: {data.shape}")
+        return data, float(np.nanstd(data))
+
     def run_all(self, do_uvcontsub: bool, bad_channel_sigma: float, detection_sigma: float,
                 imagename: Optional[str] = None, line_freq_hz: Optional[float] = None) -> None:
         """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra."""
@@ -614,6 +696,12 @@ class ExportCube:
         print(f"\n[ExportCube] run_all() — {self.output_dir}")
         if line_freq_hz:
             print(f"[ExportCube]   line = {line_freq_hz/1e9:.6f} GHz")
+
+        # Dirty continuum over all fields/SPWs from the raw (pre-contsub) data
+        cont_fits = self.make_continuum(imagename=imagename)
+        cont_map, cont_std = ExportCube.load_continuum_map(cont_fits)
+        print(f"[ExportCube] Continuum std = {cont_std*1e3:.4f} mJy/beam; "
+              f"contours at [-5,-3,3,5,7]×std")
 
         contsub_paths = self.uvcontsub() if do_uvcontsub else None
         fits_path     = self.make_cube(imagename=imagename, vis_list=contsub_paths)
@@ -644,7 +732,9 @@ class ExportCube:
                                              output_dir=str(out / "spectra"),
                                              sigma=detection_sigma,
                                              line_freq_hz=line_freq_hz,
-                                             bad_channels=bad)
+                                             bad_channels=bad,
+                                             continuum_map=cont_map,
+                                             continuum_std=cont_std)
 
         for log in Path(".").glob("casa*.log"):
             log.unlink()
