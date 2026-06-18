@@ -461,8 +461,8 @@ class ExportCube:
             z_est      = line_freq_hz / center_hz - 1.0 if line_freq_hz else None
             print(f"[ExportCube]   Gaussian: center={center_ghz:.6f} GHz,  "
                   f"FWHM={fwhm_kms:.1f} km/s,  integral={integral:.1f} mJy km/s")
-            if fwhm_kms < 100.0:
-                print(f"[ExportCube]   Skipping detection {idx} — FWHM={fwhm_kms:.1f} km/s < 100 km/s.")
+            if fwhm_kms < 70.0:
+                print(f"[ExportCube]   Skipping detection {idx} — FWHM={fwhm_kms:.1f} km/s < 70 km/s.")
                 skipped_regions.append((py, px, ell))
                 continue
             if fwhm_kms > 700.0:
