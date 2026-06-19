@@ -754,7 +754,7 @@ class ExportCube:
 
     def run_all(self, do_uvcontsub: bool, bad_channel_sigma: float, detection_sigma: float,
                 imagename: Optional[str] = None, line_freq_hz: Optional[float] = None,
-                do_linesub: bool = True, linesub_nsigma: float = 1.0,
+                do_linesub: bool = True, linesub_nsigma: float = 0.5,
                 linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0,
                 validate_linesub: bool = True,
                 linesub_overwrite: Optional[bool] = None) -> None:
