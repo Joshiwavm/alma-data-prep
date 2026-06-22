@@ -112,7 +112,12 @@ def getWeightDistribution(vis, bins=np.logspace(np.log10(0.1), np.log10(150), 31
     np.save(savename, (bin_centers, np.array(std_binned)), allow_pickle=True)
     return 1 / (np.sum(wgts[wgts>0])) ** 0.5
 
-def plotWeightDistribution(target, savename):
+def plotWeightDistribution(target, savename, npy_dir=None):
+
+    # Directory holding the per-array white-noise .npy files for this target.
+    # Defaults to the historic ../../output/<target> layout.
+    if npy_dir is None:
+        npy_dir = f'../../output/{target}'
 
     # If saving, ensure output directory exists
     if not os.path.exists(os.path.dirname(savename)):
@@ -120,8 +125,8 @@ def plotWeightDistribution(target, savename):
 
     fig, ax = plt.subplots(constrained_layout=True)
 
-    for i, f in enumerate(get_npy_files(f'../../output/{target}')):
-        bin_centers, std_binned = np.load(f'../../output/{target}/{f}')
+    for i, f in enumerate(get_npy_files(npy_dir)):
+        bin_centers, std_binned = np.load(os.path.join(npy_dir, f))
 
         labelname = 'ACA, ' if '7m' in f else '12m-array, '
         labelname += f.split('GHz')[0][-2:] + 'GHz'

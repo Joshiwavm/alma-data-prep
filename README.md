@@ -46,7 +46,9 @@ pip install -e .
 ```python
 from alma_data_prep import ProjectDataOrganizer
 
-DF = ProjectDataOrganizer('/path/to/archive')
+# base_dir collects all products under one place: <base_dir>/{data,output,plots}.
+# Override data_dir / output_dir / plots_dir individually if needed.
+DF = ProjectDataOrganizer('/path/to/archive', base_dir='/path/to/products')
 DF.mstransform_and_concat()   # transform + concat; computes white-noise sensitivity
 DF.display_structure()
 DF.export_to_csv()            # writes project_data.csv and project_data.tex

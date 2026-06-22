@@ -23,14 +23,22 @@ from . import analysis_utils as oau  # Custom utilities for white noise sensitiv
 from casatools import msmetadata  # CASA 6+ tool
 
 class ProjectDataOrganizer:
-    def __init__(self, root_dir, concatted=False, data_dir = '../../data/', plotuvdist=True):
+    def __init__(self, root_dir, concatted=False, base_dir='../..',
+                 data_dir=None, output_dir=None, plots_dir=None, plotuvdist=True):
         self.root_dir = root_dir
-        self.concatted = concatted  
-        self.data_dir = data_dir
+        self.concatted = concatted
 
-        # Ensure the new directory exists
-        if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir)
+        # All products live under base_dir. Point base_dir at a single absolute
+        # location to keep data/, output/ and plots/ together; or override any of
+        # the three individually. Defaults reproduce the historic ../../ layout.
+        self.base_dir   = base_dir
+        self.data_dir   = data_dir   if data_dir   is not None else os.path.join(base_dir, 'data')
+        self.output_dir = output_dir if output_dir is not None else os.path.join(base_dir, 'output')
+        self.plots_dir  = plots_dir  if plots_dir  is not None else os.path.join(base_dir, 'plots')
+
+        # Ensure the product directories exist
+        for d in (self.data_dir, self.output_dir, self.plots_dir):
+            os.makedirs(d, exist_ok=True)
         
         self.projects = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {
             "files": defaultdict(list), 
@@ -361,9 +369,12 @@ class ProjectDataOrganizer:
                         print(f"Warning: No concatenated data found for {group}, skipping sensitivity calculation.")
                         continue
                     try:
-                        savename=concatvis.replace('data','output')
-                        savename=savename.replace('.ms','.npy')
-                        
+                        # Mirror the concatvis path (under data_dir) into output_dir,
+                        # e.g. <data_dir>/<target>/foo.ms -> <output_dir>/<target>/foo.npy
+                        rel = os.path.relpath(concatvis, self.data_dir)
+                        savename = os.path.join(self.output_dir, rel)
+                        savename = savename.replace('.ms', '.npy')
+
                         sensitivity = oau.getWeightDistribution(concatvis,savename=savename)
                         data["white_noise_sensitivity"] = sensitivity*1e6
                     except Exception as e:
@@ -371,7 +382,12 @@ class ProjectDataOrganizer:
 
         if self.plotuvdist:
             for target in self._get_all_targets():
-                oau.plotWeightDistribution(target, f'../../plots/{target}_baselinedist.pdf')
+                target_safe = target.replace(" ", "_")
+                oau.plotWeightDistribution(
+                    target,
+                    os.path.join(self.plots_dir, f'{target_safe}_baselinedist.pdf'),
+                    npy_dir=os.path.join(self.output_dir, target_safe),
+                )
 
     def display_structure(self):
         """Print the structured project data with target names and total on-source time per group."""
@@ -406,8 +422,11 @@ class ProjectDataOrganizer:
                                 print(f"        - {ms_file}")
             print()
     
-    def export_to_csv(self, filename="../../output/project_data.csv"):
+    def export_to_csv(self, filename=None):
         """Exports group-level project data to CSV and LaTeX files."""
+
+        if filename is None:
+            filename = os.path.join(self.output_dir, "project_data.csv")
 
         output_dir = os.path.dirname(filename)
         if not os.path.exists(output_dir):
@@ -483,8 +502,10 @@ class ProjectDataOrganizer:
         with open(tex_filename, mode="w") as f:
             f.write("\n".join(lines))
 
-    def export(self, output_root: str = "../../output/vis") -> None:
+    def export(self, output_root: str = None) -> None:
         """Instantiate and run Export for every group; attaches instance to data["export"]."""
+        if output_root is None:
+            output_root = os.path.join(self.output_dir, "vis")
         if not self.concatted:
             print("Warning: Data not concatenated yet; run mstransform_and_concat() first.")
 
@@ -495,7 +516,7 @@ class ProjectDataOrganizer:
                     print(data["export"])
                     data["export"].run_all()
 
-    def export_linesubtracted(self, output_root: str = "../../output/vis_linesub") -> None:
+    def export_linesubtracted(self, output_root: str = None) -> None:
         """Run Export on the *_linesubtracted.ms produced by export_cube().
 
         Discovers, for each group, the line-removed MS derived from its
@@ -503,6 +524,8 @@ class ProjectDataOrganizer:
         continuum Export pipeline on it. Skips groups whose line-removed MS
         does not exist yet.
         """
+        if output_root is None:
+            output_root = os.path.join(self.output_dir, "vis_linesub")
         for data in self._iter_groups():
             cv = data.get("concatvis")
             if not cv:
@@ -534,8 +557,8 @@ class ProjectDataOrganizer:
 
     def export_cube(
         self,
-        output_root: str = "../../output",
-        line_name: str = None,         
+        output_root: str = None,
+        line_name: str = None,
         line_freq_hz: float = None,    
         redshift: float = 0,
         config: CubeExportConfig = None,
@@ -552,6 +575,8 @@ class ProjectDataOrganizer:
 
         """Run the spectral cube pipeline for every group (or jointly per target if combine_arrays=True)."""
 
+        if output_root is None:
+            output_root = self.output_dir
         if not self.concatted:
             print("Warning: Data not concatenated yet; run mstransform_and_concat() first.")
 
