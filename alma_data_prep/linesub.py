@@ -98,11 +98,14 @@ class LineSubtractor:
         """tclean the line emission inside the CRTF mask; return the .model path."""
         mask = build_line_mask_crtf(detections, imagename_full + ".lines.crtf", self.n_fwhm)
 
-        if self.overwrite:
-            for suffix in self._IMG_SUFFIXES:
-                p = f"{imagename_full}{suffix}"
-                if os.path.exists(p):
-                    _safe_rmtree(p)
+        # Always clear leftover tclean products before re-cleaning. These are
+        # throwaway scratch images (deleted at the end of run()); a stale .mask
+        # in particular makes tclean fail when a user mask=CRTF is also supplied.
+        # An interrupted previous run can leave them behind regardless of overwrite.
+        for suffix in self._IMG_SUFFIXES:
+            p = f"{imagename_full}{suffix}"
+            if os.path.exists(p):
+                _safe_rmtree(p)
 
         tclean(
             vis=line_vis if len(line_vis) > 1 else line_vis[0],
