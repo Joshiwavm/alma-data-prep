@@ -46,6 +46,45 @@ class ExportConfig:
     band_name: Optional[str] = None  # default derived from frequency; fallback "band1"
 
 
+# ---- Shared label helpers (used by Export and ExportCube/Organizer) ----------
+def derive_array_label(dish_size_m: Optional[int]) -> str:
+    """Map a dish size (m) to the array label used throughout the pipeline."""
+    if dish_size_m == 12:
+        return "com12m"
+    if dish_size_m == 7:
+        return "com07m"
+    return "unknown"
+
+
+def derive_band_label(freq_ghz: Optional[float], override: Optional[str] = None) -> str:
+    """Map a central frequency (GHz) to its ALMA band label (band1..band10).
+
+    Ranges are the nominal ALMA receiver bands; pass `override` (e.g. from
+    ExportConfig.band_name) to bypass the heuristic. Falls back to 'band1'.
+    """
+    if override:
+        return override
+    if freq_ghz is None:
+        return "band1"
+    f = freq_ghz
+    bands = (
+        ("band1",  35,  50),
+        ("band2",  67,  84),
+        ("band3",  84, 116),
+        ("band4", 125, 163),
+        ("band5", 163, 211),
+        ("band6", 211, 275),
+        ("band7", 275, 373),
+        ("band8", 385, 500),
+        ("band9", 602, 720),
+        ("band10",787, 950),
+    )
+    for name, lo, hi in bands:
+        if lo <= f <= hi:
+            return name
+    return "band1"
+
+
 class Export:
     """Export class that keeps track of data and filenames and can run the pipeline.
 
@@ -114,25 +153,10 @@ class Export:
 
     # ---- Derivations -----------------------------------------------------
     def _derive_array_label(self) -> str:
-        if self.dish_size_m == 12:
-            return "com12m"
-        if self.dish_size_m == 7:
-            return "com07m"
-        # Fallback
-        return "unknown"
+        return derive_array_label(self.dish_size_m)
 
     def _derive_band_label(self) -> str:
-        # Minimal mapping: default to band1 for ~39 GHz if not provided
-        if self.config.band_name:
-            return self.config.band_name
-        if self.median_freq_ghz is None:
-            return "band1"
-        # Simple ALMA band heuristics (not exhaustive)
-        f = self.median_freq_ghz
-        if 35 <= f <= 50:
-            return "band1"
-        # Extend here if needed
-        return "band1"
+        return derive_band_label(self.median_freq_ghz, override=self.config.band_name)
 
     def _derive_imaging_params(self) -> Tuple[int, str]:
         if self.dish_size_m == 12:

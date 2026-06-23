@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from casatasks import mstransform, concat, listobs, statwt
 
-from .export import Export
+from .export import Export, derive_array_label, derive_band_label
 from .export_cube import ExportCube, ExportConfig as CubeExportConfig, parse_line_freq
 
 # Add the path for analysisUtils (CASA analysis_scripts). Override location with
@@ -592,23 +592,29 @@ class ProjectDataOrganizer:
                       linesub_overwrite=linesub_overwrite)
 
         if combine_arrays:
-            target_data = defaultdict(lambda: {"vis_list": [], "dish_sizes": [], "groups": []})
+            # Combine arrays (com07m+com12m) within the SAME target AND band only —
+            # never merge different bands (e.g. band1 with band3).
+            target_data = defaultdict(lambda: {"vis_list": [], "dish_sizes": [], "groups": [], "target": "unknown"})
             for data in self._iter_groups():
                 cv = data.get("concatvis")
-                t  = data.get("target", "unknown")
                 if cv and os.path.exists(cv):
-                    target_data[t]["vis_list"].append(cv)
-                    target_data[t]["dish_sizes"].extend(data.get("dish_sizes") or [])
-                    target_data[t]["groups"].append(data)
+                    t    = data.get("target", "unknown")
+                    band = derive_band_label(data.get("median_frequency"))
+                    key  = (t, band)
+                    target_data[key]["vis_list"].append(cv)
+                    target_data[key]["dish_sizes"].extend(data.get("dish_sizes") or [])
+                    target_data[key]["groups"].append(data)
+                    target_data[key]["target"] = t
 
-            for target, td in target_data.items():
+            for (target, band_label), td in target_data.items():
                 target_safe  = target.replace(" ", "_")
                 dish_sizes   = sorted(set(int(d) for d in td["dish_sizes"]))
+                array_label  = "+".join(derive_array_label(d) for d in dish_sizes)
                 sizes_str    = "+".join(f"{d}m" for d in dish_sizes)
                 derived_name = imagename or f"{target_safe}_{sizes_str}_cube"
                 ec = ExportCube(
                     concatvis=td["vis_list"],
-                    output_dir=str(Path(output_root) / "cube" / target_safe),
+                    output_dir=str(Path(output_root) / "cube" / target_safe / band_label / array_label),
                     config=cfg, target=target, overwrite=overwrite,
                 )
                 for data in td["groups"]:
@@ -622,10 +628,16 @@ class ProjectDataOrganizer:
                     continue
                 target       = data.get("target")
                 target_safe  = target.replace(" ", "_") if target else "unknown"
+                # Nest per band/array so multi-band (e.g. band1/band3) and multi-array
+                # (com07m/com12m) groups of the same target don't overwrite each other's
+                # analysis products. Same labelling convention as export.py.
+                dish_size    = int(min(data["dish_sizes"])) if data.get("dish_sizes") else None
+                band_label   = derive_band_label(data.get("median_frequency"))
+                array_label  = derive_array_label(dish_size)
                 derived_name = imagename or Path(concatvis).stem.replace("_concatted", "_cube")
                 ec = ExportCube(
                     concatvis=concatvis,
-                    output_dir=str(Path(output_root) / "cube" / target_safe),
+                    output_dir=str(Path(output_root) / "cube" / target_safe / band_label / array_label),
                     config=cfg, target=target, overwrite=overwrite,
                 )
                 data["cube_export"] = ec
