@@ -165,10 +165,14 @@ class ExportCube:
         hi = min(nchan, peak_ch + fit_half_width + 1)
         x, y  = freq_hz[lo:hi], spectrum_jy[lo:hi]
         valid = np.array(
-            [not np.isnan(y[i]) and (lo + i) not in bad_set for i in range(len(y))],
+            [np.isfinite(x[i]) and np.isfinite(y[i]) and (lo + i) not in bad_set
+             for i in range(len(y))],
             dtype=bool,
         )
         xv, yv  = x[valid], y[valid]
+        # Need at least as many finite points as free params (3) to fit.
+        if xv.size < 3:
+            return np.nan, np.nan, np.nan, np.nan, None
         chan_hz  = abs(float(freq_hz[1] - freq_hz[0])) if nchan > 1 else 1e6
         g0 = _m.Gaussian1D(
             amplitude=float(spectrum_jy[peak_ch]),
@@ -176,7 +180,8 @@ class ExportCube:
             stddev=2.0 * chan_hz,
         )
         g0.amplitude.bounds = (0.0, None)
-        g_fit        = _f.LevMarLSQFitter()(g0, xv, yv, maxiter=500)
+        g_fit        = _f.LevMarLSQFitter()(g0, xv, yv, maxiter=500,
+                                            filter_non_finite=True)
         center_hz    = float(g_fit.mean.value)
         amplitude_jy = float(g_fit.amplitude.value)
         stddev_hz    = abs(float(g_fit.stddev.value))
@@ -466,14 +471,30 @@ class ExportCube:
             for ch in bad_set:
                 if 0 <= ch < nchan:
                     spectrum_jy[ch] = np.nan
+            # Drop any non-finite (inf) channels so the fit/peak search stay safe.
+            spectrum_jy[~np.isfinite(spectrum_jy)] = np.nan
+
+            if not np.any(np.isfinite(spectrum_jy)):
+                print(f"[ExportCube]   Skipping detection {idx} — spectrum all non-finite.")
+                skipped_regions.append((py, px, ell))
+                continue
 
             peak_ch       = int(np.nanargmax(spectrum_jy))
             peak_freq_ghz = float(freq_axis[peak_ch]) / 1e9
             peak_flux_jy  = float(spectrum_jy[peak_ch])
 
-            center_hz, amp_jy, stddev_hz, integral, g_fit = ExportCube._fit_gaussian_line(
-                freq_axis, spectrum_jy, peak_ch, bad_channels=list(bad_set)
-            )
+            try:
+                center_hz, amp_jy, stddev_hz, integral, g_fit = ExportCube._fit_gaussian_line(
+                    freq_axis, spectrum_jy, peak_ch, bad_channels=list(bad_set)
+                )
+            except Exception as e:
+                print(f"[ExportCube]   Skipping detection {idx} — Gaussian fit failed: {e}")
+                skipped_regions.append((py, px, ell))
+                continue
+            if g_fit is None or center_hz <= 0 or not np.isfinite(center_hz) or not np.isfinite(stddev_hz):
+                print(f"[ExportCube]   Skipping detection {idx} — invalid Gaussian fit.")
+                skipped_regions.append((py, px, ell))
+                continue
             center_ghz = center_hz / 1e9
             fwhm_kms   = stddev_hz * 2.3548 * C_KMS / center_hz
             z_est      = line_freq_hz / center_hz - 1.0 if line_freq_hz else None
