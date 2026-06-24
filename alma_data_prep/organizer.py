@@ -517,12 +517,13 @@ class ProjectDataOrganizer:
                     data["export"].run_all()
 
     def export_linesubtracted(self, output_root: str = None) -> None:
-        """Run Export on the *_linesubtracted.ms produced by export_cube().
+        """Run continuum Export on the best continuum MS for every group.
 
-        Discovers, for each group, the line-removed MS derived from its
-        concatvis (``<concatvis>`` -> ``*_linesubtracted.ms``) and runs the
-        continuum Export pipeline on it. Skips groups whose line-removed MS
-        does not exist yet.
+        Uses the line-removed MS (``<concatvis>`` -> ``*_linesubtracted.ms``)
+        produced by export_cube() when it exists. Groups with no detected line
+        (e.g. ACA 7m) have no line-removed MS — their concatvis is already
+        line-free, so the original concatvis is exported instead. Every group
+        therefore yields continuum visibilities.
         """
         if output_root is None:
             output_root = os.path.join(self.output_dir, "vis_linesub")
@@ -531,9 +532,12 @@ class ProjectDataOrganizer:
             if not cv:
                 continue
             linesub = cv.replace(".ms", "_linesubtracted.ms")
-            if not os.path.exists(linesub):
-                print(f"Warning: {linesub} not found; run export_cube() first. Skipping.")
-                continue
+            if os.path.exists(linesub):
+                src = linesub
+            else:
+                print(f"Info: no line-subtracted MS for {os.path.basename(cv)} "
+                      f"(no line detected); exporting original concatvis instead.")
+                src = cv
 
             dish_sizes  = data.get("dish_sizes")
             target      = data.get("target")
@@ -542,7 +546,7 @@ class ProjectDataOrganizer:
                 target=target,
                 dish_size_m=int(min(dish_sizes)) if dish_sizes else None,
                 median_freq_ghz=data.get("median_frequency"),
-                concatvis=linesub,
+                concatvis=src,
                 output_dir=str(Path(output_root) / target_safe),
             )
             data["export_linesub"] = exp
