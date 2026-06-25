@@ -158,7 +158,17 @@ class ExportCube:
 
     @staticmethod
     def _fit_gaussian_line(freq_hz, spectrum_jy, peak_ch, bad_channels=None, fit_half_width=15):
-        """Fit a 1D Gaussian to the spectrum near peak_ch."""
+        """Fit a 1D Gaussian to the spectrum near peak_ch.
+
+        Returns (center_hz, amplitude_jy, stddev_hz, integral_mjy_kms, g_fit, errs)
+        where ``errs`` is a dict of 1σ parameter uncertainties derived from the
+        fit covariance matrix:
+            center_hz, amplitude_jy, stddev_hz  — direct fit-parameter errors
+            integral                            — propagated integral error
+        Values are NaN when the covariance is unavailable (singular/failed fit).
+        """
+        nan_errs = {"center_hz": np.nan, "amplitude_jy": np.nan,
+                    "stddev_hz": np.nan, "integral": np.nan}
         nchan   = len(spectrum_jy)
         bad_set = set(bad_channels or [])
         lo = max(0, peak_ch - fit_half_width)
@@ -172,7 +182,7 @@ class ExportCube:
         xv, yv  = x[valid], y[valid]
         # Need at least as many finite points as free params (3) to fit.
         if xv.size < 3:
-            return np.nan, np.nan, np.nan, np.nan, None
+            return np.nan, np.nan, np.nan, np.nan, None, dict(nan_errs)
         chan_hz  = abs(float(freq_hz[1] - freq_hz[0])) if nchan > 1 else 1e6
         g0 = _m.Gaussian1D(
             amplitude=float(spectrum_jy[peak_ch]),
@@ -180,14 +190,33 @@ class ExportCube:
             stddev=2.0 * chan_hz,
         )
         g0.amplitude.bounds = (0.0, None)
-        g_fit        = _f.LevMarLSQFitter()(g0, xv, yv, maxiter=500,
-                                            filter_non_finite=True)
+        fitter       = _f.LevMarLSQFitter()
+        g_fit        = fitter(g0, xv, yv, maxiter=500, filter_non_finite=True)
         center_hz    = float(g_fit.mean.value)
         amplitude_jy = float(g_fit.amplitude.value)
         stddev_hz    = abs(float(g_fit.stddev.value))
         integral_mjy_kms = (amplitude_jy * stddev_hz * np.sqrt(2.0 * np.pi)
                             * C_KMS / center_hz * 1e3) if center_hz > 0 else np.nan
-        return center_hz, amplitude_jy, stddev_hz, integral_mjy_kms, g_fit
+
+        # 1σ errors from the covariance matrix. Free-param order matches
+        # Gaussian1D.param_names = (amplitude, mean, stddev); none are fixed here.
+        errs = dict(nan_errs)
+        cov  = fitter.fit_info.get("param_cov")
+        if cov is not None and np.ndim(cov) == 2 and cov.shape[0] >= 3:
+            perr = np.sqrt(np.abs(np.diag(cov)))
+            amp_err, center_err, stddev_err = (float(perr[0]),
+                                               float(perr[1]),
+                                               float(perr[2]))
+            errs["amplitude_jy"] = amp_err
+            errs["center_hz"]    = center_err
+            errs["stddev_hz"]    = stddev_err
+            if (np.isfinite(integral_mjy_kms) and amplitude_jy != 0
+                    and stddev_hz != 0 and center_hz > 0):
+                rel = np.sqrt((amp_err / amplitude_jy) ** 2
+                              + (stddev_err / stddev_hz) ** 2
+                              + (center_err / center_hz) ** 2)
+                errs["integral"] = abs(integral_mjy_kms) * rel
+        return center_hz, amplitude_jy, stddev_hz, integral_mjy_kms, g_fit, errs
 
     @staticmethod
     def _save_detection_overview_plot(moment8_map, header, regions,
@@ -389,7 +418,7 @@ class ExportCube:
     @staticmethod
     def extract_and_plot_profiles(cube, moment8_map, header, hdul, output_dir,
                                   sigma, line_freq_hz=None, bad_channels=None,
-                                  continuum_map=None, continuum_std=None):
+                                  continuum_map=None, continuum_std=None, stds=None):
         """Greedy 4σ-ellipse extraction of spectral line profiles from the moment-8 map.
 
         Algorithm
@@ -424,7 +453,11 @@ class ExportCube:
         a_pix = bmaj_deg / cdelt2_deg * SIGMA_MULT
         b_pix = bmin_deg / cdelt2_deg * SIGMA_MULT
 
-        cube_jy_pix = cube / ExportCube._beam_area_pixels(header, hdul)
+        beam_area_pix = ExportCube._beam_area_pixels(header, hdul)
+        cube_jy_pix   = cube / beam_area_pix
+        # Per-channel RMS [Jy/beam] for propagated aperture-flux noise.
+        if stds is None:
+            stds = ExportCube.std_per_channel(cube)
 
         threshold  = float(sigma)
         above_mask = np.isfinite(moment8_map) & (moment8_map > threshold)
@@ -483,8 +516,16 @@ class ExportCube:
             peak_freq_ghz = float(freq_axis[peak_ch]) / 1e9
             peak_flux_jy  = float(spectrum_jy[peak_ch])
 
+            # Aperture-flux noise [Jy] from the per-channel map RMS [Jy/beam].
+            # Correlated beam-sized noise -> σ_F = σ_beam·sqrt(N_pix/N_beam).
+            rms_ch = (float(stds[peak_ch])
+                      if 0 <= peak_ch < len(stds) and np.isfinite(stds[peak_ch])
+                      else np.nan)
+            peak_flux_err_jy = (rms_ch * np.sqrt(n_pix / beam_area_pix)
+                                if np.isfinite(rms_ch) and beam_area_pix > 0 else np.nan)
+
             try:
-                center_hz, amp_jy, stddev_hz, integral, g_fit = ExportCube._fit_gaussian_line(
+                center_hz, amp_jy, stddev_hz, integral, g_fit, fit_errs = ExportCube._fit_gaussian_line(
                     freq_axis, spectrum_jy, peak_ch, bad_channels=list(bad_set)
                 )
             except Exception as e:
@@ -498,6 +539,61 @@ class ExportCube:
             center_ghz = center_hz / 1e9
             fwhm_kms   = stddev_hz * 2.3548 * C_KMS / center_hz
             z_est      = line_freq_hz / center_hz - 1.0 if line_freq_hz else None
+
+            # Propagate 1σ errors to derived quantities
+            center_err_hz = fit_errs.get("center_hz", np.nan)
+            stddev_err_hz = fit_errs.get("stddev_hz", np.nan)
+            amp_err_jy    = fit_errs.get("amplitude_jy", np.nan)
+            integral_err  = fit_errs.get("integral", np.nan)
+            center_ghz_err = center_err_hz / 1e9
+            if (np.isfinite(stddev_err_hz) and np.isfinite(center_err_hz)
+                    and stddev_hz != 0 and center_hz > 0):
+                fwhm_err_kms = fwhm_kms * np.sqrt((stddev_err_hz / stddev_hz) ** 2
+                                                  + (center_err_hz / center_hz) ** 2)
+            else:
+                fwhm_err_kms = np.nan
+            z_err = (line_freq_hz * center_err_hz / center_hz ** 2
+                     if (line_freq_hz and np.isfinite(center_err_hz) and center_hz > 0)
+                     else None)
+            amp_err_mjy = amp_err_jy * 1e3
+
+            # Cross-check: Gaussian amplitude error (from fit covariance) vs the
+            # amplitude error propagated from the per-channel aperture RMS.
+            # For a Gaussian fit the amplitude is constrained by ~N_eff channels,
+            # so σ_amp = σ_chan·sqrt(Δν_chan / (sqrt(π)·σ_line)) — smaller than the
+            # single-channel noise. The two estimates should agree to a factor ~few.
+            chan_hz_cc = abs(float(freq_axis[1] - freq_axis[0])) if nchan > 1 else np.nan
+            amp_err_rms_jy = (peak_flux_err_jy
+                              * np.sqrt(chan_hz_cc / (np.sqrt(np.pi) * stddev_hz))
+                              if (np.isfinite(peak_flux_err_jy) and np.isfinite(chan_hz_cc)
+                                  and stddev_hz > 0) else np.nan)
+            if (np.isfinite(amp_err_jy) and np.isfinite(amp_err_rms_jy)
+                    and amp_err_rms_jy > 0):
+                err_ratio = amp_err_jy / amp_err_rms_jy
+                print(f"[ExportCube]   Err-check det {idx}: "
+                      f"σ_amp(Gauss)={amp_err_jy*1e3:.3f} mJy  vs  "
+                      f"σ_amp(RMS-prop)={amp_err_rms_jy*1e3:.3f} mJy  "
+                      f"ratio={err_ratio:.2f}"
+                      + ("  [MISMATCH >3x]" if (err_ratio > 3 or err_ratio < 1 / 3) else ""))
+
+            # Integral cross-check: per-channel aperture RMS propagated over the
+            # N_bins = FWHM/Δv_chan channels that span the line:
+            #   σ_I = σ_chan·Δv_chan·sqrt(N_bins) = σ_chan·sqrt(Δv_chan·FWHM)  [mJy·km/s]
+            # Reported integral error stays the Gaussian-fit value; this is a check.
+            dv_chan_kms = (chan_hz_cc / center_hz * C_KMS
+                           if (np.isfinite(chan_hz_cc) and center_hz > 0) else np.nan)
+            integral_err_rms = (peak_flux_err_jy * 1e3 * np.sqrt(dv_chan_kms * fwhm_kms)
+                                if (np.isfinite(peak_flux_err_jy) and np.isfinite(dv_chan_kms)
+                                    and dv_chan_kms > 0 and fwhm_kms > 0) else np.nan)
+            if (np.isfinite(integral_err) and np.isfinite(integral_err_rms)
+                    and integral_err_rms > 0):
+                int_ratio = integral_err / integral_err_rms
+                n_bins    = fwhm_kms / dv_chan_kms
+                print(f"[ExportCube]   Err-check det {idx}: "
+                      f"σ_I(Gauss)={integral_err:.1f}  vs  "
+                      f"σ_I(RMS-prop, N={n_bins:.1f} bins)={integral_err_rms:.1f} mJy·km/s  "
+                      f"ratio={int_ratio:.2f}"
+                      + ("  [MISMATCH >3x]" if (int_ratio > 3 or int_ratio < 1 / 3) else ""))
             print(f"[ExportCube]   Gaussian: center={center_ghz:.6f} GHz,  "
                   f"FWHM={fwhm_kms:.1f} km/s,  integral={integral:.1f} mJy km/s")
             if fwhm_kms < 70.0:
@@ -526,12 +622,18 @@ class ExportCube:
                 "pix_y":          py,
                 "n_pix":          n_pix,
                 "center_GHz":     f"{center_ghz:.6f}",
+                "center_GHz_err": f"{center_ghz_err:.6f}" if np.isfinite(center_ghz_err) else "",
                 "peak_GHz":       f"{peak_freq_ghz:.6f}",
                 "redshift":       f"{z_est:.6f}" if z_est is not None else "",
+                "redshift_err":   f"{z_err:.6f}" if (z_err is not None and np.isfinite(z_err)) else "",
                 "FWHM_kms":       f"{fwhm_kms:.1f}",
+                "FWHM_kms_err":   f"{fwhm_err_kms:.1f}" if np.isfinite(fwhm_err_kms) else "",
                 "amplitude_mJy":  f"{amp_jy * 1e3:.3f}",
+                "amplitude_mJy_err": f"{amp_err_mjy:.3f}" if np.isfinite(amp_err_mjy) else "",
                 "peak_flux_mJy":  f"{peak_flux_jy * 1e3:.3f}",
+                "peak_flux_mJy_err": f"{peak_flux_err_jy * 1e3:.3f}" if np.isfinite(peak_flux_err_jy) else "",
                 "integral_mJy_kms": f"{integral:.1f}",
+                "integral_mJy_kms_err": f"{integral_err:.1f}" if np.isfinite(integral_err) else "",
                 # geometry for line-subtraction mask (not written to CSV)
                 "a_arcsec":       a_pix * cdelt2_deg * 3600.0,
                 "b_arcsec":       b_pix * cdelt2_deg * 3600.0,
@@ -645,9 +747,12 @@ class ExportCube:
         # Write Gaussian statistics of kept detections to CSV
         # (geometry keys ending in arcsec/deg/_f are for line subtraction, not CSV)
         csv_cols = ["detection", "RA_J2000", "Dec_J2000", "RA_deg", "Dec_deg",
-                    "pix_x", "pix_y", "n_pix", "center_GHz", "peak_GHz",
-                    "redshift", "FWHM_kms", "amplitude_mJy", "peak_flux_mJy",
-                    "integral_mJy_kms"]
+                    "pix_x", "pix_y", "n_pix",
+                    "center_GHz", "center_GHz_err", "peak_GHz",
+                    "redshift", "redshift_err", "FWHM_kms", "FWHM_kms_err",
+                    "amplitude_mJy", "amplitude_mJy_err",
+                    "peak_flux_mJy", "peak_flux_mJy_err",
+                    "integral_mJy_kms", "integral_mJy_kms_err"]
         if detections:
             csv_path = os.path.join(output_dir, "detections.csv")
             with open(csv_path, mode="w", newline="") as f:
@@ -828,6 +933,7 @@ class ExportCube:
             bad_channels=bad,
             continuum_map=cont_map,
             continuum_std=cont_std,
+            stds=stds,
         )
 
         # Clean the line model inside detection masks and subtract it from the
