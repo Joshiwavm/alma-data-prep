@@ -95,7 +95,7 @@ class ProjectDataOrganizer:
 
     def _find_ms_split_cal_directories(self):
         """Find all .ms.split.cal directories and organize them by project."""
-        for root, dirs, _ in os.walk(self.root_dir):
+        for root, dirs, _ in os.walk(self.root_dir, followlinks=True):
             for directory in dirs:
                 if directory.endswith(".ms.split.cal"):
                     full_path = os.path.join(root, directory)
@@ -284,6 +284,12 @@ class ProjectDataOrganizer:
 
     def mstransform_and_concat(self):
         """Transforms and concatenates visibility data."""
+        if not self.projects:
+            raise RuntimeError(
+                "No *.ms.split.cal directories found under "
+                f"{self.root_dir!r}; nothing to concatenate."
+            )
+
         print(f"Concatinating Observation Sets")
 
         for project_code, science_goals in self.projects.items():
@@ -356,10 +362,7 @@ class ProjectDataOrganizer:
 
     def _get_white_noise_sensitivity(self):
         """Computes and stores the white noise sensitivity for each group UID."""
-        
-        # Ensure data is concatenated before computing white noise sensitivity
-        if not self.concatted:
-            self.mstransform_and_concat()
+        assert self.concatted, "mstransform_and_concat() must run before this."
 
         for project_code, science_goals in self.projects.items():
             for science_goal, groups in science_goals.items():
