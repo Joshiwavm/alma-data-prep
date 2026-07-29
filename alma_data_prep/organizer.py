@@ -320,8 +320,8 @@ class ProjectDataOrganizer:
                             vis = self._get_vis_path(ms_file, project_code=project_code, science_goal=science_goal, group=group, member=member)
                             outputvis = os.path.join(self.data_dir, f"{target_name}_{str(data['dish_sizes'][0]).split('.')[0]}m_{str(data['median_frequency']).split('.')[0]}GHz_uid{i}_tbin30s.ms")
 
-                            if not os.path.exists(vis):  
-                                print(f"Warning: ms = {vis} already existed, skipping...")
+                            if not os.path.exists(vis):
+                                print(f"Warning: ms = {vis} not found, skipping...")
                                 continue
                             try:
                                 spw = au.getScienceSpws(vis, intent='OBSERVE_TARGET#ON_SOURCE', returnString=True)
@@ -355,7 +355,7 @@ class ProjectDataOrganizer:
                         if os.path.exists(vis_file):
                             shutil.rmtree(vis_file)
 
-            self.concatted = True
+        self.concatted = True
 
         self._get_white_noise_sensitivity()
 

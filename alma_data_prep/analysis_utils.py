@@ -42,7 +42,9 @@ def uvdist_to_l(uvdist):
     return arcsec_to_l(uvdist_to_arcsec(uvdist))
 
 def get_npy_files(directory):
-    """Returns a list of .npy files in the given directory."""
+    """Returns a list of .npy files in the given directory (empty if it doesn't exist)."""
+    if not os.path.isdir(directory):
+        return []
     return [f for f in os.listdir(directory) if f.endswith(".npy")]
 
 def uvload(vis):
@@ -119,13 +121,18 @@ def plotWeightDistribution(target, savename, npy_dir=None):
     if npy_dir is None:
         npy_dir = f'../../output/{target}'
 
+    npy_files = get_npy_files(npy_dir)
+    if not npy_files:
+        print(f"Warning: no white-noise .npy files found for {target} in {npy_dir}, skipping plot.")
+        return
+
     # If saving, ensure output directory exists
     if not os.path.exists(os.path.dirname(savename)):
         os.makedirs(os.path.dirname(savename))
 
     fig, ax = plt.subplots(constrained_layout=True)
 
-    for i, f in enumerate(get_npy_files(npy_dir)):
+    for i, f in enumerate(npy_files):
         bin_centers, std_binned = np.load(os.path.join(npy_dir, f))
 
         labelname = 'ACA, ' if '7m' in f else '12m-array, '
