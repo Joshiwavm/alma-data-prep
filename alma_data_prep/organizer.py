@@ -5,11 +5,15 @@ import csv
 import shutil
 import pandas as pd
 from collections import defaultdict
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from casatasks import mstransform, concat, listobs, statwt
 
 from .export import Export, derive_array_label, derive_band_label
-from .export_cube import ExportCube, ExportConfig as CubeExportConfig, parse_line_freq
+from .export_cube import (
+    ExportCube, ExportConfig as CubeExportConfig, parse_line_freq,
+    derive_cube_imaging_params,
+)
 
 # Add the path for analysisUtils (CASA analysis_scripts). Override location with
 # the CASA_ANALYSIS_SCRIPTS environment variable; falls back to the Allegro path.
@@ -46,6 +50,7 @@ class ProjectDataOrganizer:
             "on_source_time": None,
             "min_resolution": None,
             "MRS": None,
+            "primary_beam_arcsec": None,
             "dish_sizes": None,
             "median_frequency": None,
             "concatvis": None,
@@ -69,6 +74,7 @@ class ProjectDataOrganizer:
         self._get_total_on_source_time()
         self._get_minimum_resolution()
         self._get_maximum_recoverable_scale()
+        self._get_primary_beam()
 
     def _get_vis_path(self, ms_file, **kwargs):
         if self.concatted:
@@ -281,6 +287,29 @@ class ProjectDataOrganizer:
                         data["MRS"] = mrs_radians * rad_to_arcsec  # Convert to arcseconds
                     else:
                         data["MRS"] = None  # Could not compute MRS
+
+    def _get_primary_beam(self):
+        """Computes the ALMA primary beam FWHM (arcsec) per group from dish size + frequency.
+
+        Uses analysisUtils' Baars-2007 taper formula (au.primaryBeamArcsec) rather
+        than a hand-rolled lambda/D constant, so 7m vs 12m obscuration is handled
+        correctly. Used to size the cube/moment-8 field of view per group.
+        """
+        for project_code, science_goals in self.projects.items():
+            for science_goal, groups in science_goals.items():
+                for group, data in groups.items():
+                    if not (data.get("dish_sizes") and data.get("median_frequency")):
+                        data["primary_beam_arcsec"] = None
+                        continue
+                    try:
+                        data["primary_beam_arcsec"] = au.primaryBeamArcsec(
+                            frequency=data["median_frequency"],
+                            diameter=min(data["dish_sizes"]),
+                            showEquation=False,
+                        )
+                    except Exception as e:
+                        print(f"Error computing primary beam for {group}: {e}")
+                        data["primary_beam_arcsec"] = None
 
     def mstransform_and_concat(self):
         """Transforms and concatenates visibility data."""
@@ -578,6 +607,7 @@ class ProjectDataOrganizer:
         do_linesub: bool = True,
         validate_linesub: bool = True,
         linesub_overwrite: bool = None,
+        detection_bin_kms: float = 30.0,
     ) -> None:
 
         """Run the spectral cube pipeline for every group (or jointly per target if combine_arrays=True)."""
@@ -588,6 +618,12 @@ class ProjectDataOrganizer:
             print("Warning: Data not concatenated yet; run mstransform_and_concat() first.")
 
         cfg = config or CubeExportConfig()
+        # TODO: redshift is a silent no-op when line_name isn't given (only
+        # parse_line_freq() below consumes it). For a target with several
+        # catalog lines spread across bands (e.g. a multi-band FIR line
+        # survey), auto-match each group's observed frequency against
+        # LINE_REST_FREQ_GHZ at this redshift instead of requiring one
+        # line_name per call. Fix later.
         if line_name is not None:
             obs_freq_str, rest_freq_hz = parse_line_freq(line_name, redshift)
             cfg.restfreq = obs_freq_str
@@ -596,7 +632,8 @@ class ProjectDataOrganizer:
 
         run_kw = dict(line_freq_hz=line_freq_hz, do_linesub=do_linesub,
                       validate_linesub=validate_linesub,
-                      linesub_overwrite=linesub_overwrite)
+                      linesub_overwrite=linesub_overwrite,
+                      detection_bin_kms=detection_bin_kms)
 
         if combine_arrays:
             # Combine arrays (com07m+com12m) within the SAME target AND band only —
@@ -619,10 +656,24 @@ class ProjectDataOrganizer:
                 array_label  = "+".join(derive_array_label(d) for d in dish_sizes)
                 sizes_str    = "+".join(f"{d}m" for d in dish_sizes)
                 derived_name = imagename or f"{target_safe}_{sizes_str}_cube"
+
+                # Same primary-beam-based FoV as the non-combined branch. Use the
+                # smallest dish (widest PB, e.g. 7m) so the combined image covers
+                # everything any array in the mix can see, and the finest
+                # synthesized beam among the combined groups for cell sizing.
+                grp_cfg = dc_replace(cfg)
+                if grp_cfg.imsize is None or grp_cfg.cell is None:
+                    pbs   = [d.get("primary_beam_arcsec") for d in td["groups"] if d.get("primary_beam_arcsec")]
+                    beams = [d.get("min_resolution") for d in td["groups"] if d.get("min_resolution")]
+                    auto_imsize, auto_cell = derive_cube_imaging_params(
+                        max(pbs) if pbs else None, min(beams) if beams else None)
+                    grp_cfg.imsize = grp_cfg.imsize or auto_imsize
+                    grp_cfg.cell   = grp_cfg.cell or auto_cell
+
                 ec = ExportCube(
                     concatvis=td["vis_list"],
                     output_dir=str(Path(output_root) / "cube" / target_safe / band_label / array_label),
-                    config=cfg, target=target, overwrite=overwrite,
+                    config=grp_cfg, target=target, overwrite=overwrite,
                 )
                 for data in td["groups"]:
                     data["cube_export"] = ec
@@ -642,10 +693,23 @@ class ProjectDataOrganizer:
                 band_label   = derive_band_label(data.get("median_frequency"))
                 array_label  = derive_array_label(dish_size)
                 derived_name = imagename or Path(concatvis).stem.replace("_concatted", "_cube")
+
+                # Per-group config copy: FoV/cell scale with primary beam (dish
+                # size + frequency), not a fixed grid, so higher-frequency maps
+                # get a correspondingly smaller field of view. Nyquist-sampled
+                # off the synthesized beam Organizer already computed. Only
+                # fills in imsize/cell left unset by the caller.
+                grp_cfg = dc_replace(cfg)
+                if grp_cfg.imsize is None or grp_cfg.cell is None:
+                    auto_imsize, auto_cell = derive_cube_imaging_params(
+                        data.get("primary_beam_arcsec"), data.get("min_resolution"))
+                    grp_cfg.imsize = grp_cfg.imsize or auto_imsize
+                    grp_cfg.cell   = grp_cfg.cell or auto_cell
+
                 ec = ExportCube(
                     concatvis=concatvis,
                     output_dir=str(Path(output_root) / "cube" / target_safe / band_label / array_label),
-                    config=cfg, target=target, overwrite=overwrite,
+                    config=grp_cfg, target=target, overwrite=overwrite,
                 )
                 data["cube_export"] = ec
                 ec.run_all(do_uvcontsub, bad_channel_sigma, detection_sigma, imagename=derived_name, **run_kw)
