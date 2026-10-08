@@ -25,6 +25,8 @@ from casatasks import split, tclean, exportfits
 from casatools import ms as ms_tool
 from casatools import msmetadata as msmd_tool
 
+from .weights import baseline_id, variance_scale, write_scales
+
 
 @dataclass
 class ExportConfig:
@@ -44,6 +46,9 @@ class ExportConfig:
     imsize_7m: int = 512
     imcell_7m: str = "1.5arcsec"
     band_name: Optional[str] = None  # default derived from frequency; fallback "band1"
+    # Divide the channel-averaged weights by the factor measured from the
+    # visibilities (correlated channels make split overcount them).
+    fix_weights: bool = True
 
 
 # ---- Shared label helpers (used by Export and ExportCube/Organizer) ----------
@@ -210,6 +215,7 @@ class Export:
         
         fields, spws = self._discover_fields_spws()
         binvis = self._build_binvis_prefix()
+        scale_rows = []
 
         for field in fields:
             print(f"Processing field {field}")
@@ -250,7 +256,8 @@ class Export:
                     _ms2.selectinit(0)
                     _ms2.select({"field_id": 0})
                     freqs2 = _ms2.range("chan_freq")["chan_freq"][:, 0]
-                    rec = _ms2.getdata(["u", "v", "data", "weight", "flag"])
+                    rec = _ms2.getdata(["u", "v", "data", "weight", "flag",
+                                        "time", "antenna1", "antenna2"])
                 finally:
                     _ms2.close()
 
@@ -262,11 +269,26 @@ class Export:
                 uvwght = 4.0 / (1.0 / rec["weight"][0][flags] + 1.0 / rec["weight"][1][flags])
                 uvfreq = np.ones(np.shape(uwave)) * freqs2[0]
 
+                if self.config.fix_weights:
+                    base = baseline_id(rec["antenna1"], rec["antenna2"])
+                    scale, robust, npairs = variance_scale(
+                        uvreal, uvimag, uvwght, rec["time"][flags],
+                        base[flags])
+                    uvwght = uvwght / scale
+                    scale_rows.append(dict(
+                        file=os.path.basename(outvis), field=field, spw=spw,
+                        npairs=npairs, scale=f"{scale:.6f}",
+                        robust_scale=f"{robust:.6f}"))
+                    print(f"  weights divided by measured scale {scale:.3f}")
+
                 uvdata = np.array([uwave, vwave, uvreal, uvimag, uvwght, uvfreq])
                 np.savez_compressed(f"{outvis.replace('.ms.', '.im.')}.data", uvdata)
                 # Cleanup split MS
                 if os.path.exists(outvis):
                     shutil.rmtree(outvis, ignore_errors=True)
+
+        write_scales(os.path.join(os.path.dirname(binvis),
+                                  "weight_scales.csv"), scale_rows)
 
     def tclean_and_export_fits(self) -> None:
         """Run tclean for each field/SPW pair and export FITS products; then cleanup CASA images and adjust PB FITS."""
