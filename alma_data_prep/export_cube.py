@@ -53,9 +53,51 @@ LINE_REST_FREQ_GHZ: dict[str, float] = {
     "HCN(3-2)":  265.886434,  "HCN(4-3)":  354.505477,
     "HCO+(1-0)":  89.188526,  "HCO+(3-2)": 267.557625,  "HCO+(4-3)": 356.734288,
     "CS(2-1)":    97.980953,  "CS(7-6)":   342.882857,
+    # Far-IR fine-structure lines (rest-frame wavelength-labelled, matching the
+    # naming used in high-z ISM line-survey papers, e.g. [CII]158um).
+    "[OI]63um":    4744.777490,  "[OI]145um":   2060.069000,
+    "[NII]122um":  2459.380000,  "[NII]205um":  1461.133800,
+    "[OIII]88um":  3393.006240,
+    "[CII]158um":  1900.536900,
+    "[CI]370um":    809.341970,  "[CI]609um":    492.160651,
 }
 
 C_KMS = 2.99792458e5
+
+# Gaussian-fit defaults for extract_and_plot_profiles/_fit_gaussian_line. The
+# old defaults (2-channel stddev guess, +/-15 channel fit window) biased the
+# fit onto a single noisy channel for genuinely broad lines instead of the
+# real line -- observed as spuriously narrow (~1 native channel) fitted
+# FWHM. 300 km/s is a more realistic initial guess for a high-z line width;
+# the window is widened accordingly so the fit can see enough of the profile
+# to converge on it (and on anything up to the FWHM_KMS_MAX cut below).
+LINE_FWHM_GUESS_KMS = 300.0
+FIT_HALF_WIDTH_CHANNELS = 200
+FWHM_KMS_MIN = 70.0
+FWHM_KMS_MAX = 3000.0
+
+
+def derive_cube_imaging_params(pb_fwhm_arcsec: Optional[float],
+                                synth_beam_arcsec: Optional[float] = None,
+                                fov_pb_mult: float = 2.0, px_per_beam: float = 5.0
+                                ) -> tuple[int, str]:
+    """Derive (imsize, cell) so the image FoV scales with the primary beam.
+
+    ``pb_fwhm_arcsec`` is Organizer's ``data["primary_beam_arcsec"]``
+    (analysisUtils' Baars-2007 taper formula, computed once per group from
+    dish size + frequency). cell is Nyquist-sampled off the synthesized beam
+    (Organizer's ``min_resolution``, ``px_per_beam`` pixels across it); imsize
+    covers ``fov_pb_mult`` primary-beam FWHMs at that cell size, rounded up to
+    even. Falls back to a fixed 512px/1.5arcsec grid if the primary beam is
+    unknown (matches the pipeline's historic default).
+    """
+    if not pb_fwhm_arcsec:
+        return 512, "1.5arcsec"
+
+    cell = (synth_beam_arcsec / px_per_beam) if synth_beam_arcsec else (pb_fwhm_arcsec / 100.0)
+    imsize = int(np.ceil((fov_pb_mult * pb_fwhm_arcsec) / cell))
+    imsize += imsize % 2   # tclean prefers even sizes
+    return imsize, f"{cell:.4f}arcsec"
 
 
 @dataclass
@@ -157,7 +199,8 @@ class ExportCube:
         return (u / max(a_pix, 0.5)) ** 2 + (v / max(b_pix, 0.5)) ** 2 <= 1.0
 
     @staticmethod
-    def _fit_gaussian_line(freq_hz, spectrum_jy, peak_ch, bad_channels=None, fit_half_width=15):
+    def _fit_gaussian_line(freq_hz, spectrum_jy, peak_ch, bad_channels=None,
+                            fit_half_width=FIT_HALF_WIDTH_CHANNELS):
         """Fit a 1D Gaussian to the spectrum near peak_ch.
 
         Returns (center_hz, amplitude_jy, stddev_hz, integral_mjy_kms, g_fit, errs)
@@ -184,10 +227,14 @@ class ExportCube:
         if xv.size < 3:
             return np.nan, np.nan, np.nan, np.nan, None, dict(nan_errs)
         chan_hz  = abs(float(freq_hz[1] - freq_hz[0])) if nchan > 1 else 1e6
+        # Initial stddev guess from LINE_FWHM_GUESS_KMS (300 km/s) rather than a
+        # fixed 2-channel width -- a narrow guess biases the fit onto a single
+        # noisy channel instead of the real (often much broader) line.
+        stddev_guess_hz = (LINE_FWHM_GUESS_KMS / 2.3548) / C_KMS * freq_hz[peak_ch]
         g0 = _m.Gaussian1D(
             amplitude=float(spectrum_jy[peak_ch]),
             mean=float(freq_hz[peak_ch]),
-            stddev=2.0 * chan_hz,
+            stddev=stddev_guess_hz,
         )
         g0.amplitude.bounds = (0.0, None)
         fitter       = _f.LevMarLSQFitter()
@@ -314,6 +361,26 @@ class ExportCube:
         return np.nanstd(cube, axis=(1, 2))
 
     @staticmethod
+    def _channel_width_kms(freq_axis):
+        """Return the (positive) channel width in km/s at the cube's mean frequency."""
+        if len(freq_axis) < 2:
+            return 0.0
+        chan_hz  = abs(float(freq_axis[1] - freq_axis[0]))
+        freq_ref = float(np.mean(freq_axis))
+        return chan_hz / freq_ref * C_KMS if freq_ref > 0 else 0.0
+
+    @staticmethod
+    def bin_spectrally(cube, n_bin):
+        """Average groups of n_bin adjacent channels (nanmean); drops any remainder channels."""
+        nchan = cube.shape[0]
+        n_new = nchan // n_bin
+        if n_new < 1:
+            return cube
+        trimmed = cube[: n_new * n_bin]
+        with np.errstate(invalid="ignore"):
+            return np.nanmean(trimmed.reshape(n_new, n_bin, *cube.shape[1:]), axis=1)
+
+    @staticmethod
     def find_bad_channels(stds, sigma=4, flag_high_rms=False):
         """Return channel indices with zero or NaN std.
 
@@ -418,7 +485,8 @@ class ExportCube:
     @staticmethod
     def extract_and_plot_profiles(cube, moment8_map, header, hdul, output_dir,
                                   sigma, line_freq_hz=None, bad_channels=None,
-                                  continuum_map=None, continuum_std=None, stds=None):
+                                  continuum_map=None, continuum_std=None, stds=None,
+                                  target=None):
         """Greedy 4σ-ellipse extraction of spectral line profiles from the moment-8 map.
 
         Algorithm
@@ -440,8 +508,13 @@ class ExportCube:
             Continuum image (same pixel grid as moment-8) for contour overlay.
         continuum_std : float, optional
             Std of the continuum map; contours drawn at [-5,-3,3,5,7]×std.
+        target : str, optional
+            Tags every print with the target name so it's greppable in a
+            multi-target log. Candidates that pass the SNR cut but fail the
+            post-fit checks are also logged to ``skipped_detections.csv``.
         """
         os.makedirs(output_dir, exist_ok=True)
+        tag           = f"[ExportCube:{target}]" if target else "[ExportCube]"
         bad_set       = set(bad_channels or [])
         nchan, ny, nx = cube.shape
         freq_axis     = ExportCube._get_freq_axis(header, nchan)
@@ -476,7 +549,7 @@ class ExportCube:
                 used |= ell
                 regions.append((py, px, ell))
 
-        print(f"[ExportCube] {len(regions)} detection(s) above SNR = {sigma}.")
+        print(f"{tag} {len(regions)} detection(s) above SNR = {sigma}.")
 
         diag_dir = os.path.join(os.path.dirname(os.path.abspath(output_dir)), "diagnostics")
         os.makedirs(diag_dir, exist_ok=True)
@@ -495,9 +568,25 @@ class ExportCube:
         kept_regions    = []
         skipped_regions = []
         detections      = []   # per-kept-detection stats for CSV
+        skipped_log     = []   # per-skipped-candidate stats for skipped_detections.csv
         wcs2d           = WCS(header).celestial
 
         for idx, (py, px, ell) in enumerate(regions, start=1):
+            sky      = wcs2d.pixel_to_world(px, py)
+            ra_deg   = float(sky.icrs.ra.deg)
+            dec_deg  = float(sky.icrs.dec.deg)
+            radec_hd = sky.icrs.to_string("hmsdms", sep=":", precision=2)
+            ra_str, dec_str = radec_hd.split(" ")
+
+            def _skip(reason, **extra):
+                print(f"{tag}   Skipping detection {idx} at pix({py},{px}) — {reason}")
+                skipped_regions.append((py, px, ell))
+                rec = {"candidate": idx, "RA_J2000": ra_str, "Dec_J2000": dec_str,
+                       "RA_deg": f"{ra_deg:.6f}", "Dec_deg": f"{dec_deg:.6f}",
+                       "pix_x": px, "pix_y": py, "reason": reason}
+                rec.update(extra)
+                skipped_log.append(rec)
+
             ell_flat    = ell.ravel()
             n_pix       = int(ell_flat.sum())
             spectrum_jy = np.nansum(cube_2d[:, ell_flat], axis=1).astype(float)
@@ -508,8 +597,7 @@ class ExportCube:
             spectrum_jy[~np.isfinite(spectrum_jy)] = np.nan
 
             if not np.any(np.isfinite(spectrum_jy)):
-                print(f"[ExportCube]   Skipping detection {idx} — spectrum all non-finite.")
-                skipped_regions.append((py, px, ell))
+                _skip("spectrum all non-finite", n_pix=n_pix)
                 continue
 
             peak_ch       = int(np.nanargmax(spectrum_jy))
@@ -524,17 +612,25 @@ class ExportCube:
             peak_flux_err_jy = (rms_ch * np.sqrt(n_pix / beam_area_pix)
                                 if np.isfinite(rms_ch) and beam_area_pix > 0 else np.nan)
 
+            # Per-channel aperture-flux 1σ error, same propagation as
+            # peak_flux_err_jy above but kept as a full array for
+            # shading a noise band behind the zoomed spectrum plot.
+            spectrum_err_jy = (stds * np.sqrt(n_pix / beam_area_pix)
+                               if beam_area_pix > 0
+                               else np.full_like(stds, np.nan, dtype=float))
+            spectrum_err_mjy = spectrum_err_jy * 1e3
+
             try:
                 center_hz, amp_jy, stddev_hz, integral, g_fit, fit_errs = ExportCube._fit_gaussian_line(
                     freq_axis, spectrum_jy, peak_ch, bad_channels=list(bad_set)
                 )
             except Exception as e:
-                print(f"[ExportCube]   Skipping detection {idx} — Gaussian fit failed: {e}")
-                skipped_regions.append((py, px, ell))
+                _skip(f"Gaussian fit failed: {e}", n_pix=n_pix,
+                      peak_GHz=f"{peak_freq_ghz:.6f}", peak_flux_mJy=f"{peak_flux_jy*1e3:.3f}")
                 continue
             if g_fit is None or center_hz <= 0 or not np.isfinite(center_hz) or not np.isfinite(stddev_hz):
-                print(f"[ExportCube]   Skipping detection {idx} — invalid Gaussian fit.")
-                skipped_regions.append((py, px, ell))
+                _skip("invalid Gaussian fit (non-finite/non-positive center or width)", n_pix=n_pix,
+                      peak_GHz=f"{peak_freq_ghz:.6f}", peak_flux_mJy=f"{peak_flux_jy*1e3:.3f}")
                 continue
             center_ghz = center_hz / 1e9
             fwhm_kms   = stddev_hz * 2.3548 * C_KMS / center_hz
@@ -570,7 +666,7 @@ class ExportCube:
             if (np.isfinite(amp_err_jy) and np.isfinite(amp_err_rms_jy)
                     and amp_err_rms_jy > 0):
                 err_ratio = amp_err_jy / amp_err_rms_jy
-                print(f"[ExportCube]   Err-check det {idx}: "
+                print(f"{tag}   Err-check det {idx}: "
                       f"σ_amp(Gauss)={amp_err_jy*1e3:.3f} mJy  vs  "
                       f"σ_amp(RMS-prop)={amp_err_rms_jy*1e3:.3f} mJy  "
                       f"ratio={err_ratio:.2f}"
@@ -589,29 +685,30 @@ class ExportCube:
                     and integral_err_rms > 0):
                 int_ratio = integral_err / integral_err_rms
                 n_bins    = fwhm_kms / dv_chan_kms
-                print(f"[ExportCube]   Err-check det {idx}: "
+                print(f"{tag}   Err-check det {idx}: "
                       f"σ_I(Gauss)={integral_err:.1f}  vs  "
                       f"σ_I(RMS-prop, N={n_bins:.1f} bins)={integral_err_rms:.1f} mJy·km/s  "
                       f"ratio={int_ratio:.2f}"
                       + ("  [MISMATCH >3x]" if (int_ratio > 3 or int_ratio < 1 / 3) else ""))
-            print(f"[ExportCube]   Gaussian: center={center_ghz:.6f} GHz,  "
-                  f"FWHM={fwhm_kms:.1f} km/s,  integral={integral:.1f} mJy km/s")
-            if fwhm_kms < 70.0:
-                print(f"[ExportCube]   Skipping detection {idx} — FWHM={fwhm_kms:.1f} km/s < 70 km/s.")
-                skipped_regions.append((py, px, ell))
+            fit_window_kms = (2 * FIT_HALF_WIDTH_CHANNELS * abs(freq_axis[1] - freq_axis[0])
+                               / center_hz * C_KMS) if nchan > 1 else np.nan
+            print(f"{tag}   Gaussian: center={center_ghz:.6f} GHz,  "
+                  f"FWHM={fwhm_kms:.1f} km/s,  integral={integral:.1f} mJy km/s,  "
+                  f"fit window={fit_window_kms:.0f} km/s")
+            if fwhm_kms < FWHM_KMS_MIN:
+                _skip(f"FWHM={fwhm_kms:.1f} km/s < {FWHM_KMS_MIN:.0f} km/s cut "
+                      f"(fit window was {fit_window_kms:.0f} km/s)",
+                      n_pix=n_pix, center_GHz=f"{center_ghz:.6f}", FWHM_kms=f"{fwhm_kms:.1f}",
+                      peak_flux_mJy=f"{peak_flux_jy*1e3:.3f}")
                 continue
-            if fwhm_kms > 700.0:
-                print(f"[ExportCube]   Skipping detection {idx} — FWHM={fwhm_kms:.1f} km/s > 700 km/s.")
-                skipped_regions.append((py, px, ell))
+            if fwhm_kms > FWHM_KMS_MAX:
+                _skip(f"FWHM={fwhm_kms:.1f} km/s > {FWHM_KMS_MAX:.0f} km/s cut "
+                      f"(fit window was {fit_window_kms:.0f} km/s — may be too narrow for this line)",
+                      n_pix=n_pix, center_GHz=f"{center_ghz:.6f}", FWHM_kms=f"{fwhm_kms:.1f}",
+                      peak_flux_mJy=f"{peak_flux_jy*1e3:.3f}")
                 continue
             kept_regions.append((py, px, ell))
 
-            # Sky coordinates (J2000) of the detection peak pixel
-            sky      = wcs2d.pixel_to_world(px, py)
-            ra_deg   = float(sky.icrs.ra.deg)
-            dec_deg  = float(sky.icrs.dec.deg)
-            radec_hd = sky.icrs.to_string("hmsdms", sep=":", precision=2)
-            ra_str, dec_str = radec_hd.split(" ")
             detections.append({
                 "detection":      len(kept_regions),
                 "RA_J2000":       ra_str,
@@ -643,7 +740,7 @@ class ExportCube:
             })
 
             if z_est is not None:
-                print(f"[ExportCube]   Redshift: z = {z_est:.6f}  (v = {z_est * C_KMS:.0f} km/s)")
+                print(f"{tag}   Redshift: z = {z_est:.6f}  (v = {z_est * C_KMS:.0f} km/s)")
 
             # Frequency window: ±0.75 GHz around Gaussian center, clipped to coverage
             plot_lo = max(freq_ghz.min(), center_ghz - HALF_BW_GHZ)
@@ -722,6 +819,9 @@ class ExportCube:
             zoom_x = freq_axis[(freq_axis / 1e9 >= zoom_lo) & (freq_axis / 1e9 <= zoom_hi)]
 
             fig2, ax2z = plt.subplots(figsize=(5, 5))
+            ax2z.fill_between(freq_ghz, -spectrum_err_mjy, spectrum_err_mjy,
+                               step="mid", color="gray", alpha=0.3, lw=0,
+                               zorder=1)
             ax2z.plot(freq_ghz, spectrum_mjy, color="steelblue", lw=1.0, drawstyle="steps-mid", zorder=2)
             ax2z.plot(zoom_x / 1e9, g_fit(zoom_x) * 1e3, color="darkorange", lw=1.8, alpha=0.85, zorder=4,
                       label=f"Gaussian  {center_ghz:.5f} GHz{z_lbl}\nFWHM={round(fwhm_kms):.0f} km/s  I={round(integral):.0f} mJy km/s")
@@ -759,7 +859,21 @@ class ExportCube:
                 writer = csv.DictWriter(f, fieldnames=csv_cols, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(detections)
-            print(f"[ExportCube] Wrote {len(detections)} detection(s) to {csv_path}")
+            print(f"{tag} Wrote {len(detections)} detection(s) to {csv_path}")
+
+        # Candidates that passed the SNR cut but were rejected afterwards (fit
+        # failure or the FWHM cut) — kept so a "clear line in the sample
+        # spectrum" that didn't make the cut can be diagnosed after the fact.
+        if skipped_log:
+            skip_cols = ["candidate", "RA_J2000", "Dec_J2000", "RA_deg", "Dec_deg",
+                         "pix_x", "pix_y", "n_pix", "peak_GHz", "center_GHz",
+                         "FWHM_kms", "peak_flux_mJy", "reason"]
+            skip_csv_path = os.path.join(output_dir, "skipped_detections.csv")
+            with open(skip_csv_path, mode="w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=skip_cols, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(skipped_log)
+            print(f"{tag} Wrote {len(skipped_log)} skipped candidate(s) to {skip_csv_path}")
 
         return detections
 
@@ -883,7 +997,8 @@ class ExportCube:
                 do_linesub: bool = True, linesub_nsigma: float = 0.5,
                 linesub_niter: int = 100000, linesub_n_fwhm: float = 2.0,
                 validate_linesub: bool = True,
-                linesub_overwrite: Optional[bool] = None) -> None:
+                linesub_overwrite: Optional[bool] = None,
+                detection_bin_kms: float = 30.0) -> None:
         """End-to-end pipeline: uvcontsub → tclean → flag channels → moment-8 → spectra → linesub."""
         out      = self.output_dir / "analysis"
         diag_dir = out / "diagnostics"
@@ -907,7 +1022,8 @@ class ExportCube:
         freq_axis = ExportCube._get_freq_axis(header, data.shape[0])
         stds      = ExportCube.std_per_channel(data)
         bad       = ExportCube.find_bad_channels(stds, sigma=bad_channel_sigma)
-        print(f"[ExportCube] Bad channels ({bad_channel_sigma}σ, {len(bad)} total): {bad}")
+        run_tag   = f"[ExportCube:{self.target}]" if self.target else "[ExportCube]"
+        print(f"{run_tag} Bad channels ({bad_channel_sigma}σ, {len(bad)} total): {bad}")
 
         ExportCube.plot_channel_rms(stds, freq_axis, bad, sigma=bad_channel_sigma,
                                     outfile=str(diag_dir / "channel_rms.png"),
@@ -916,7 +1032,25 @@ class ExportCube:
                                         outfile=str(diag_dir / "sample_spectrum_center.png"),
                                         title="Sample spectrum (SNR) — center pixel")
 
-        m8        = ExportCube.make_moment8_map(data, stds)
+        chan_width_kms = ExportCube._channel_width_kms(freq_axis)
+        if not detection_bin_kms or chan_width_kms <= 0 or chan_width_kms >= detection_bin_kms:
+            n_bin = 1
+            if detection_bin_kms and chan_width_kms >= detection_bin_kms:
+                print(f"{run_tag} Native channel width {chan_width_kms:.2f} km/s already "
+                      f">= {detection_bin_kms} km/s target; skipping detection binning.")
+        else:
+            n_bin = max(1, round(detection_bin_kms / chan_width_kms))
+        if n_bin > 1:
+            masked = data.copy()
+            if bad:
+                masked[bad] = np.nan
+            binned_cube = ExportCube.bin_spectrally(masked, n_bin)
+            binned_stds = ExportCube.std_per_channel(binned_cube)
+            print(f"{run_tag} Detection cube: {chan_width_kms:.2f} km/s native channels "
+                  f"binned x{n_bin} -> ~{chan_width_kms * n_bin:.1f} km/s for moment-8/detection.")
+            m8 = ExportCube.make_moment8_map(binned_cube, binned_stds)
+        else:
+            m8 = ExportCube.make_moment8_map(data, stds)
         fits_stem = os.path.basename(fits_path)
         m8_name   = fits_stem.replace("_contsub_cube.cube.fits", "_contsub_moment8.fits")
         if m8_name == fits_stem:
@@ -934,6 +1068,7 @@ class ExportCube:
             continuum_map=cont_map,
             continuum_std=cont_std,
             stds=stds,
+            target=self.target,
         )
 
         # Clean the line model inside detection masks and subtract it from the
